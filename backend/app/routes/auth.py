@@ -4,13 +4,12 @@ from ..auth import create_token, require_user, verify_app_password
 from ..config import settings
 from ..kotak_client import KotakService
 from ..schemas import KotakCompleteBody
-from ..ws_manager import Hub
 
 router = APIRouter()
 
 # singletons wired in main.py
 kotak: KotakService | None = None
-hub: Hub | None = None
+bridge = None
 
 
 @router.post("/login")
@@ -34,20 +33,13 @@ def kotak_complete(body: KotakCompleteBody):
         kotak.complete_login(settings.kotak_mobile_number, settings.kotak_ucc, body.totp, settings.kotak_mpin)
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
-    # (re)subscribe index + order feed on the server, near exchange
+    # Feeds run on the server via the SFeed bridge (SDK v3 async WS on a
+    # background thread). Legacy client.subscribe() was removed in v2.2+.
     try:
-        c = kotak.client
-        import asyncio
-        loop = asyncio.get_event_loop()
-        c.on_message = lambda m: hub.on_ticks(m, loop) if hub else None
-        c.on_open = lambda r: None
-        c.on_close = lambda r: None
-        c.subscribe(instrument_tokens=[
-            {"instrument_token": "Nifty 50", "exchange_segment": "nse_cm"},
-            {"instrument_token": "SENSEX", "exchange_segment": "bse_cm"}], isIndex=True)
-        c.subscribe_to_orderfeed()
+        if bridge is not None:
+            bridge.start()
     except Exception as e:
-        return {"ok": True, "warn": f"logged in, WS subscribe failed: {e}"}
+        return {"ok": True, "warn": f"logged in, feed bridge failed: {e}"}
     return {"ok": True}
 
 

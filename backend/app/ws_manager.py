@@ -1,10 +1,10 @@
-"""Fan-out hub: Kotak WS callbacks -> browser WebSockets + synthetic engine."""
+"""Fan-out hub: SFeed bridge -> browser WebSockets.
 
-import asyncio
+The SFeedBridge (sfeed_bridge.py) pushes tick/order/position messages here from
+its own thread; broadcast() always runs on the FastAPI event loop.
+"""
+
 import json
-import logging
-
-log = logging.getLogger("ws")
 
 
 class Hub:
@@ -12,6 +12,7 @@ class Hub:
         self.clients: set = set()
         self.engine = None
         self.latest: dict = {}  # token -> last tick
+        self.main_loop = None  # set at app startup; bridge pushes onto it
 
     def set_engine(self, engine):
         self.engine = engine
@@ -24,7 +25,7 @@ class Hub:
 
     async def broadcast(self, msg: dict):
         dead = []
-        text = json.dumps(msg)
+        text = json.dumps(msg, default=str)
         for ws in self.clients:
             try:
                 await ws.send_text(text)
@@ -32,35 +33,3 @@ class Hub:
                 dead.append(ws)
         for ws in dead:
             self.clients.discard(ws)
-
-    # called from Kotak SDK threads -> schedule onto event loop
-    def on_ticks(self, message, loop: asyncio.AbstractEventLoop):
-        try:
-            if not isinstance(message, dict):
-                message = json.loads(message)
-        except Exception:
-            return
-        if message.get("type") == "stock_feed":
-            for tick in message.get("data", []) or []:
-                if tick.get("tk"):
-                    self.latest[str(tick["tk"])] = tick
-                if self.engine:
-                    try:
-                        self.engine.on_tick(tick)
-                    except Exception as e:
-                        log.error("engine tick err: %s", e)
-                asyncio.run_coroutine_threadsafe(self.broadcast({"kind": "tick", "tick": tick}), loop)
-        elif message.get("type") == "order_feed":
-            try:
-                payload = json.loads(message["data"])
-                if payload.get("type") == "order":
-                    od = payload.get("data", {})
-                    if self.engine and od.get("nOrdNo"):
-                        try:
-                            self.engine.on_order_update(od)
-                        except Exception as e:
-                            log.error("engine order err: %s", e)
-                    asyncio.run_coroutine_threadsafe(
-                        self.broadcast({"kind": "order", "order": od}), loop)
-            except Exception as e:
-                log.error("order feed parse err: %s", e)

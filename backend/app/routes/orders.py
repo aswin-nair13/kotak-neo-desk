@@ -14,6 +14,7 @@ router = APIRouter()
 kotak: KotakService | None = None
 engine: SyntheticEngine | None = None
 hub: Hub | None = None
+bridge = None  # SFeedBridge, wired in main.py
 
 
 def _lot(instrument: str) -> int:
@@ -49,11 +50,18 @@ def _place_tracked(exchange, symbol, qty, entry, body_target, body_stop, strateg
     entry_id = r.get("nOrdNo")
     target = float(entry) + float(body_target)
     stop = float(entry) - float(body_stop)
+    token = str(kotak.token_for(symbol, exchange))
     engine.add({"entry_order_id": entry_id, "sl_order_id": None, "trading_symbol": symbol,
                 "status": "PENDING_ENTRY", "strategy": strategy, "target_price": str(target),
                 "stop_loss_price": str(stop), "trail_distance": trail, "high_water_mark": 0.0,
                 "quantity": qty, "exchange_segment": exchange,
-                "instrument_token": str(kotak.token_for(symbol, exchange))})
+                "instrument_token": token})
+    # stream this leg's ticks so target/trailing can fire
+    try:
+        if bridge is not None:
+            bridge.ensure_option(exchange, token)
+    except Exception:
+        pass
     return {"entry_order_id": entry_id, "symbol": symbol, "entry": entry,
             "target": target, "stop": stop}
 
