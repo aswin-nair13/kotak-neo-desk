@@ -171,6 +171,37 @@ class KotakService:
     def order_history(self, order_id: str):
         return self._require().order_history(order_id=str(order_id))
 
+    def quote_ltp(self, trading_symbol: str, exchange: str) -> float | None:
+        """Live LTP for one F&O symbol via v3 quotes(). Returns None on any failure."""
+        tok = self.token_for(trading_symbol, exchange)
+        if not tok:
+            log.warning("quote: no token for %s", trading_symbol)
+            return None
+        try:
+            res = self._require().quotes(
+                instrument_tokens=[{"instrument_token": str(tok), "exchange_segment": exchange}])
+        except Exception as e:
+            log.error("quote %s failed: %s", trading_symbol, e)
+            return None
+        # Defensive parse — backend shape varies; try common containers/keys.
+        cands: list = []
+        if isinstance(res, dict):
+            data = res.get("data", res)
+            cands = data if isinstance(data, list) else [data]
+        elif isinstance(res, list):
+            cands = res
+        for c in cands:
+            if not isinstance(c, dict):
+                continue
+            for k in ("ltp", "iv", "lastTradedPrice", "lastPrice", "c", "close"):
+                try:
+                    if c.get(k) not in (None, ""):
+                        return float(c[k])
+                except (TypeError, ValueError):
+                    continue
+        log.warning("quote: no LTP parsed for %s: %s", trading_symbol, str(res)[:200])
+        return None
+
     # ---------- positions (same aggregation as TransTrader.get_positions) ----------
     def positions(self) -> dict:
         try:

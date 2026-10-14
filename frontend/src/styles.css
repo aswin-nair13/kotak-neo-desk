@@ -1,0 +1,137 @@
+/* KotakAPI Trader — dark terminal theme. No framework, plain CSS. */
+:root {
+  --bg: #0d1117;
+  --panel: #161b22;
+  --panel-2: #1c2330;
+  --border: #2a3342;
+  --text: #e6edf3;
+  --muted: #8b949e;
+  --accent: #2f81f7;
+  --green: #3fb950;
+  --red: #f85149;
+  --amber: #d29922;
+  --radius: 10px;
+}
+* { box-sizing: border-box; }
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+  font-family: "Segoe UI", system-ui, -apple-system, sans-serif;
+  font-size: 14px;
+}
+.page { max-width: 1200px; margin: 0 auto; padding: 20px 16px 60px; }
+
+/* header */
+.topbar {
+  display: flex; align-items: center; gap: 12px; flex-wrap: wrap;
+  padding: 14px 18px; background: var(--panel);
+  border: 1px solid var(--border); border-radius: var(--radius);
+  margin-bottom: 14px;
+}
+.topbar h1 { font-size: 19px; margin: 0; letter-spacing: 0.3px; }
+.topbar .spacer { flex: 1; }
+.pill {
+  display: inline-flex; align-items: center; gap: 6px;
+  font-size: 12.5px; font-weight: 600;
+  padding: 4px 12px; border-radius: 999px; border: 1px solid var(--border);
+  background: var(--panel-2); white-space: nowrap;
+}
+.pill .dot { width: 9px; height: 9px; border-radius: 50%; }
+.pill.on { color: var(--green); border-color: #2ea04355; }
+.pill.on .dot { background: var(--green); box-shadow: 0 0 6px var(--green); }
+.pill.off { color: var(--red); border-color: #f8514955; }
+.pill.off .dot { background: var(--red); box-shadow: 0 0 6px var(--red); }
+
+/* ticker strip */
+.tickers { display: flex; gap: 10px; flex-wrap: wrap; margin-bottom: 14px; }
+.ticker {
+  background: var(--panel); border: 1px solid var(--border);
+  border-radius: var(--radius); padding: 8px 16px; min-width: 170px;
+}
+.ticker .sym { font-size: 11px; color: var(--muted); text-transform: uppercase; letter-spacing: 1px; }
+.ticker .px { font-size: 21px; font-weight: 700; font-variant-numeric: tabular-nums; }
+
+/* cards */
+.card {
+  background: var(--panel); border: 1px solid var(--border);
+  border-radius: var(--radius); padding: 16px 18px; margin-bottom: 14px;
+}
+.card h2 { margin: 0 0 4px; font-size: 15px; }
+.card .sub { color: var(--muted); font-size: 12.5px; margin: 0 0 12px; }
+.card.disabled { opacity: 0.55; }
+
+/* forms */
+.grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(130px, 1fr)); gap: 10px; }
+.field label { display: block; font-size: 11px; color: var(--muted); margin-bottom: 4px; text-transform: uppercase; letter-spacing: 0.6px; }
+.field input, .field select, .row input, .row select {
+  width: 100%; padding: 8px 10px; font-size: 14px;
+  background: #0d1117; color: var(--text);
+  border: 1px solid var(--border); border-radius: 7px; outline: none;
+}
+.field input:focus, .field select:focus { border-color: var(--accent); }
+.field select option, .row select option { background: #161b22; color: var(--text); }
+.row { display: flex; gap: 8px; flex-wrap: wrap; align-items: end; }
+.btn {
+  padding: 9px 18px; font-size: 13.5px; font-weight: 600; cursor: pointer;
+  color: #fff; background: #1f6feb; border: 1px solid #1f6feb; border-radius: 7px;
+}
+.btn:hover:not(:disabled) { background: #2f81f7; }
+.btn:disabled { opacity: 0.45; cursor: not-allowed; }
+.btn.buy { background: #238636; border-color: #238636; }
+.btn.buy:hover:not(:disabled) { background: #2ea043; }
+.btn.ghost { background: transparent; border-color: var(--border); color: var(--text); }
+.btn.sm { padding: 6px 12px; font-size: 12.5px; }
+.ltp { font-size: 13px; font-weight: 700; color: var(--amber); font-variant-numeric: tabular-nums; min-width: 64px; }
+
+/* message banner */
+.msg { padding: 10px 14px; border-radius: 8px; margin: 0 0 14px; font-size: 13px; }
+.msg.ok { background: #0f2c1a; border: 1px solid #2ea04366; color: #7ee787; }
+.msg.err { background: #2c1215; border: 1px solid #f8514966; color: #ffa198; }
+.msg.info { background: #12233b; border: 1px solid #2f81f766; color: #79c0ff; }
+
+/* tables */
+table.tbl { width: 100%; border-collapse: collapse; font-size: 13px; }
+.tbl th { text-align: left; color: var(--muted); font-weight: 600; font-size: 11px;
+  text-transform: uppercase; letter-spacing: 0.6px; padding: 8px 10px; border-bottom: 1px solid var(--border); }
+.tbl td { padding: 8px 10px; border-bottom: 1px solid #21262d; font-variant-numeric: tabular-nums; }
+.tbl tr:last-child td { border-bottom: none; }
+.empty { color: var(--muted); font-style: italic; padding: 12px 4px; }
+.st { font-size: 11.5px; font-weight: 700; padding: 3px 10px; border-radius: 999px; }
+.st.PENDING_ENTRY { background: #3b2f0b; color: var(--amber); }
+.st.ACTIVE { background: #0f2c1a; color: var(--green); }
+.st.TRAILING, .st.CLOSING { background: #12233b; color: #79c0ff; }
+.st.CLOSED { background: #21262d; color: var(--muted); }
+.st.ERRORED { background: #2c1215; color: var(--red); }
+
+/* order feed */
+.feed { display: flex; flex-direction: column; gap: 8px; max-height: 320px; overflow: auto; }
+.ord {
+  display: flex; gap: 12px; align-items: baseline; flex-wrap: wrap;
+  background: var(--panel-2); border: 1px solid var(--border);
+  border-left: 4px solid var(--accent); border-radius: 8px; padding: 9px 12px; font-size: 13px;
+}
+.ord .sym { font-weight: 700; }
+.ord .side-B { color: var(--green); font-weight: 700; }
+.ord .side-S { color: var(--red); font-weight: 700; }
+.ord .status { margin-left: auto; font-weight: 700; font-size: 12px; }
+.ord .reason { flex-basis: 100%; color: var(--muted); font-style: italic; font-size: 12px; }
+.ord.s-complete, .ord.s-filled { border-left-color: var(--green); }
+.ord.s-complete .status, .ord.s-filled .status { color: var(--green); }
+.ord.s-rejected { border-left-color: var(--red); }
+.ord.s-rejected .status { color: var(--red); }
+.ord.s-cancelled, .ord.s-expired { border-left-color: var(--muted); }
+.ord.s-cancelled .status, .ord.s-expired .status { color: var(--muted); }
+.ord.s-pending .status, .ord.s-open .status { color: var(--amber); }
+
+/* login page */
+.login-wrap { min-height: 90vh; display: flex; align-items: center; justify-content: center; }
+.login-card { width: 360px; }
+.login-card input { margin-bottom: 10px; }
+.login-card .btn { width: 100%; margin-top: 4px; }
+.totp-help {
+  background: #12233b; border: 1px solid #2f81f766; color: #b6d9ff;
+  border-radius: 8px; padding: 10px 12px; font-size: 12.5px; line-height: 1.55; margin-bottom: 12px;
+}
+.totp-help b { color: #79c0ff; }
+code.inline { background: #0d1117; padding: 1px 6px; border-radius: 5px; font-size: 12px; }

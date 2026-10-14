@@ -73,6 +73,20 @@ def test_login_signatures():
     inspect.signature(NeoAPI.totp_validate).bind(object(), mpin="m")
 
 
+def test_quote_uses_v3_quotes(svc):
+    s, fake = svc
+    s.nse_fo_tokens = {"NIFTY25N1825450CE": "99999"}
+    fake.quotes.return_value = {"data": [{"ltp": "123.45"}]}
+    assert s.quote_ltp("NIFTY25N1825450CE", "nse_fo") == 123.45
+    bind(NeoAPI.quotes, fake.quotes.call_args.kwargs)
+
+
+def test_quote_none_without_token(svc):
+    s, fake = svc
+    assert s.quote_ltp("NOPE25N1800000CE", "nse_fo") is None
+    fake.quotes.assert_not_called()
+
+
 def test_bo_rejected_synthetic_only():
     schemas.SingleOrderBody(instrument="NIFTY", expiry="25N18", option_type="CE",
                             strike="25450", product="MIS")
