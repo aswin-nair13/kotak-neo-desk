@@ -55,3 +55,10 @@ def kotak_verify():
     ok=false with 401 detail means the TOTP/MPIN login is dead despite looking live."""
     assert kotak is not None
     return kotak.session_check()
+
+
+@router.get("/kotak/egress-ip", dependencies=[Depends(require_user)])
+def kotak_egress_ip():
+    """Public IP Kotak sees. Must be a whitelisted static IPv4 or orders 401 (stCode 100008)."""
+    assert kotak is not None
+    return kotak.egress_ip()

@@ -28,6 +28,7 @@ export default function App() {
   const [totp, setTotp] = useState('')
   const [kotakIn, setKotakIn] = useState(false)
   const [kotakBusy, setKotakBusy] = useState(false)
+  const [egressIp, setEgressIp] = useState(null)
   const [ticks, setTicks] = useState({})
   const [orders, setOrders] = useState([])
   const [synthetic, setSynthetic] = useState([])
@@ -88,6 +89,10 @@ export default function App() {
       setKotakIn(true)
       say('ok', 'Kotak session live. Expiries loading…')
       await refresh(true)
+      try {
+        const ip = await api.get('/auth/kotak/egress-ip', auth)
+        setEgressIp(ip.data.ip || null)
+      } catch { setEgressIp(null) }
     } catch (e) {
       say('err', `Kotak login failed: ${e.response?.data?.detail || e.message}`)
     } finally {
@@ -107,6 +112,10 @@ export default function App() {
       setPositions(p.data.positions || {})
       const live = !!st.data.logged_in
       setKotakIn(live)
+      if (live && !egressIp) {
+        api.get('/auth/kotak/egress-ip', auth).then(
+          (r) => setEgressIp(r.data.ip || null), () => {})
+      }
       if (live) await loadExpiries(f.instrument, justLoggedIn ? '' : f.expiry)
     } catch (e) {
       say('err', `Refresh failed: ${e.response?.data?.detail || e.message}`)
@@ -241,6 +250,20 @@ export default function App() {
               {kotakBusy ? 'Connecting…' : 'Kotak TOTP login'}
             </button>
           </div>
+        </div>
+      )}
+
+      {kotakIn && (
+        <div className="card">
+          <h2>Kotak session</h2>
+          <p className="sub">
+            Kotak sees this server as <code className="inline">{egressIp || '…resolving'}</code>.
+            Since Apr-2026, <b>order APIs accept only whitelisted static IPv4</b> (NEO app → Trade API → Add IP,
+            max 2, change allowed weekly) — and the session must be created from that same IP.
+            Anything else fails orders with <code className="inline">100008 unauthorized</code> while
+            quotes/positions keep working. Home broadband dynamic IPs will NOT work for orders;
+            use an EC2 Elastic IP (static) for the live setup.
+          </p>
         </div>
       )}
 

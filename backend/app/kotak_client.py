@@ -223,6 +223,24 @@ class KotakService:
             return {"ok": True}
         return {"ok": False, "detail": str(res)[:300]}
 
+    def egress_ip(self) -> dict:
+        """The public IP Kotak sees for this session (SDK whatsmyip, needs 2FA).
+
+        Since 1-Apr-2026 Kotak enforces static-IP whitelisting on ORDER APIs only:
+        this IP must be a whitelisted static IPv4, and the session must have been
+        created from it — otherwise orders fail with stCode 100008 while every
+        read API keeps working.
+        """
+        try:
+            res = self._require().whatsmyip()
+        except Exception as e:
+            return {"ip": None, "detail": str(e)[:200]}
+        try:
+            ip = res["data"][0]["ip"]
+            return {"ip": ip, "raw": res}
+        except (KeyError, IndexError, TypeError):
+            return {"ip": None, "detail": str(res)[:200]}
+
     def quote_ltp(self, trading_symbol: str, exchange: str) -> float | None:
         """Live LTP for one F&O symbol via v3 quotes(). Returns None on any failure."""
         tok = self.token_for(trading_symbol, exchange)

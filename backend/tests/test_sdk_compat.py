@@ -110,6 +110,20 @@ def test_quote_none_without_token(svc):
     fake.quotes.assert_not_called()
 
 
+def test_egress_ip_parses_whatsmyip(svc):
+    s, fake = svc
+    fake.whatsmyip.return_value = {"data": [{"ip": "1.2.3.4", "time": "x"}],
+                                   "stCode": 1000, "status": "success"}
+    assert s.egress_ip()["ip"] == "1.2.3.4"
+    inspect.signature(NeoAPI.whatsmyip).bind(object())
+
+
+def test_egress_ip_failure_shape(svc):
+    s, fake = svc
+    fake.whatsmyip.return_value = {"Error Message": "Complete the 2fa process"}
+    assert s.egress_ip()["ip"] is None
+
+
 def test_bo_rejected_synthetic_only():
     schemas.SingleOrderBody(instrument="NIFTY", expiry="25N18", option_type="CE",
                             strike="25450", product="MIS")
