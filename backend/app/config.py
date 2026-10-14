@@ -1,8 +1,15 @@
+from pathlib import Path
+
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+# Single .env at the repo root (same file docker compose uses), resolved by
+# absolute path so the server finds it whether you launch from backend/ or root.
+# Real env vars still take precedence over the file.
+REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 
 
 class Settings(BaseSettings):
-    model_config = SettingsConfigDict(env_file=".env", extra="ignore")
+    model_config = SettingsConfigDict(env_file=str(REPO_ROOT / ".env"), extra="ignore")
     app_username: str = "trader"
     app_password_bcrypt: str = ""
     jwt_secret: str = "change-me"
