@@ -128,7 +128,7 @@ export default function App() {
         <label>strategy<br /><select value={f.strategy} onChange={(e) => setF({ ...f, strategy: e.target.value })}>
           <option value="market_exit">market_exit</option><option value="trailing_stop">trailing_stop</option></select></label>
         <label>product<br /><select value={f.product} onChange={(e) => setF({ ...f, product: e.target.value })}>
-          <option>MIS</option><option>BO</option><option>NRML</option></select></label>
+          <option>MIS</option><option>NRML</option><option>CNC</option></select></label>
       </div>
       <div style={{ marginTop: 8, display: 'flex', gap: 8 }}>
         <button onClick={() => place('CE')}>Buy CE</button>

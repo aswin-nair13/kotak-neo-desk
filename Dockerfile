@@ -1,4 +1,4 @@
-# Single image: build React, serve via FastAPI (uvicorn)
+# Single image: build React, serve via FastAPI (uvicorn). Python deps via uv.
 FROM node:20-slim AS fe
 WORKDIR /fe
 COPY frontend/package.json frontend/package-lock.json* ./
@@ -6,12 +6,14 @@ RUN npm install
 COPY frontend/ ./
 RUN npm run build
 
-FROM python:3.12-slim
+FROM ghcr.io/astral-sh/uv:python3.12-bookworm-slim AS be
 WORKDIR /srv
-COPY backend/requirements.txt ./
-RUN pip install --no-cache-dir -r requirements.txt
+ENV UV_FROZEN=1 UV_NO_DEV=1
+COPY backend/pyproject.toml backend/uv.lock ./backend/
+RUN --mount=type=cache,target=/root/.cache/uv \
+    uv sync --project backend --no-install-project
 COPY backend/ ./backend/
 COPY --from=fe /fe/dist ./frontend/dist
-ENV PYTHONPATH=/srv/backend
+ENV PYTHONPATH=/srv/backend PATH="/srv/backend/.venv/bin:$PATH"
 EXPOSE 8000
-CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
+CMD ["uv", "run", "--project", "backend", "uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]

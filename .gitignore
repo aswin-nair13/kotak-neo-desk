@@ -1,4 +1,4 @@
-# Python
+﻿# Python
 __pycache__/
 *.py[cod]
 .venv/
@@ -17,3 +17,5 @@ frontend/dist/
 .vscode/
 .DS_Store
 Thumbs.db
+logs/
+

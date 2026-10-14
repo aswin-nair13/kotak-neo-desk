@@ -37,19 +37,12 @@ def _leg(instrument, expiry, option_type, strike, lots, mode, ref_ltp, entry_off
     return exchange, symbol, qty, entry
 
 
-def _place_tracked(exchange, symbol, qty, entry, body_target, body_stop, strategy, trail, product, bo):
+def _place_tracked(exchange, symbol, qty, entry, body_target, body_stop, strategy, trail, product):
+    """Place entry as plain Limit; SL/target/trailing are managed synthetically by the engine.
+    (SDK v3 place_order exposes no native BO/CO kwargs.)"""
     assert kotak is not None and engine is not None
-    ltp_hint = hub.latest if hub else {}
     kw = dict(exchange_segment=exchange, quantity=qty, trading_symbol=symbol,
               transaction_type="B", product=product, order_type="L", price=entry)
-    if product == "BO":  # native bracket — exchange manages SL/target
-        tok = kotak.token_for(symbol, exchange)
-        kw.update(scrip_token=tok, square_off_type="Absolute", stop_loss_type="Absolute",
-                  square_off_value=str(bo.get("square_off") or body_target),
-                  stop_loss_value=str(bo.get("stop_loss") or body_stop),
-                  last_traded_price=str(entry),
-                  trailing_stop_loss="Y" if bo.get("trailing") else "N",
-                  trailing_sl_value=str(trail) if bo.get("trailing") else "0")
     r = kotak.place_order(**kw)
     if not (r and r.get("stCode") == 200):
         raise HTTPException(status_code=502, detail=f"Entry rejected for {symbol}: {r}")
@@ -74,9 +67,7 @@ def place_single(body: SingleOrderBody, ref_ltp: float = 0):
     ex, sym, qty, entry = _leg(body.instrument, body.expiry, body.option_type, body.strike,
                                body.lots, body.entry_mode, ltp, body.entry_offset)
     return _place_tracked(ex, sym, qty, entry, body.target_points, body.stop_points,
-                          body.strategy, body.trail_distance, body.product,
-                          {"square_off": body.bo_square_off, "stop_loss": body.bo_stop_loss,
-                           "trailing": body.bo_trailing == "Y"})
+                          body.strategy, body.trail_distance, body.product)
 
 
 @router.post("/straddle", dependencies=[Depends(require_user)])
@@ -87,7 +78,7 @@ def place_straddle(body: StraddleBody, ce_ltp: float = 0, pe_ltp: float = 0):
     for otype, strike, ltp in (("CE", body.ce_strike, ce_ltp), ("PE", body.pe_strike, pe_ltp)):
         ex, sym, qty, entry = _leg(body.instrument, body.expiry, otype, strike, body.lots, body.entry_mode, ltp, 0)
         out.append(_place_tracked(ex, sym, qty, entry, body.target_points, body.stop_points,
-                                  body.strategy, body.trail_distance, body.product, {}))
+                                  body.strategy, body.trail_distance, body.product))
     return {"legs": out}
 
 
@@ -101,7 +92,7 @@ def list_synthetic():
 def orderbook():
     assert kotak is not None
     try:
-        return kotak.order_history()
+        return kotak.order_book()  # v3: order_report(); order_history() needs one order_id
     except Exception as e:
         raise HTTPException(status_code=502, detail=str(e))
 
@@ -116,9 +107,16 @@ def cancel(order_id: str):
 
 
 @router.post("/modify-sl/{order_id}", dependencies=[Depends(require_user)])
-def modify_sl(order_id: str, trigger: float):
-    assert kotak is not None
+def modify_sl(order_id: str, trigger: float, quantity: str | None = None):
+    """v3 modify_order requires quantity — taken from the synthetic tracker if omitted."""
+    assert kotak is not None and engine is not None
+    qty = quantity
+    if not qty:
+        syn = engine.by_any_id(order_id)
+        qty = syn["quantity"] if syn else None
+    if not qty:
+        raise HTTPException(status_code=400, detail="Pass ?quantity= (leg not tracked synthetically)")
     try:
-        return kotak.modify_sl(order_id, str(trigger))
+        return kotak.modify_sl(order_id, qty, str(trigger))
     except Exception as e:
         raise HTTPException(status_code=502, detail=str(e))

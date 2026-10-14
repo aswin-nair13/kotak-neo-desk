@@ -113,7 +113,7 @@ class SyntheticEngine:
         if new_sl > float(syn["stop_loss_price"]):
             log.info("trail %s: SL %s -> %.2f", syn["trading_symbol"], syn["stop_loss_price"], new_sl)
             try:
-                self.broker.modify_sl(syn["sl_order_id"], f"{new_sl:.2f}")
+                self.broker.modify_sl(syn["sl_order_id"], syn["quantity"], f"{new_sl:.2f}")
                 syn["stop_loss_price"] = new_sl
             except Exception as e:
                 log.error("trail modify failed: %s", e)

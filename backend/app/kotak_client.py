@@ -1,11 +1,17 @@
-"""Thin wrapper over kotak-neo-python (neo_api_client.NeoAPI).
+"""Thin wrapper over Kotak Neo SDK v3 (PyPI: kotakneoapi, module: neo_api_client).
 
 Port of TransTrader/broker.py concepts to a headless service:
-  - totp two-step login (initiate -> complete with OTP/TOTP)
+  - totp two-step login (initiate -> complete with TOTP)
   - scrip-master cache for nse_fo / bse_fo (trading_symbol -> token)
   - place / modify / cancel, positions aggregation
-  - native BO support via product="BO" + square_off/stop_loss params
-    (falls back to synthetic engine in synthetic_engine.py when exchange rejects BO)
+
+v3 notes (verified against installed kotakneoapi 3.0.7):
+  - ctor: NeoAPI(consumer_key=..., environment=...)
+  - scrip_master(exchange_segment) -> CSV URL str (or {"Error": ...} dict on failure)
+  - place_order() has NO market_protection/pf/BO kwargs -> bracket behaviour comes
+    solely from SyntheticEngine (synthetic_engine.py), not native BO product.
+  - modify_order() REQUIRES quantity -> callers must pass it (tracked per leg).
+  - full day order book = order_report(), NOT order_history() (needs an order_id).
 """
 
 import io
@@ -42,9 +48,9 @@ class KotakService:
 
     def initiate_login(self):
         if NeoAPI is None:
-            raise RuntimeError("neo-api-client not installed (pip install -r requirements.txt)")
-        self.pending_client = NeoAPI(environment="prod", access_token=None,
-                                     neo_fin_key=None, consumer_key=self.consumer_key)
+            raise RuntimeError("kotakneoapi not installed (cd backend && uv sync)")
+        # Same style as SwingTrader KotakProvider: consumer_key + environment only.
+        self.pending_client = NeoAPI(consumer_key=self.consumer_key, environment="prod")
         return True
 
     def complete_login(self, mobile: str, ucc: str, totp: str, mpin: str):
@@ -76,6 +82,9 @@ class KotakService:
         client = self._require()
         try:
             url = client.scrip_master(exchange_segment=segment)
+            if not isinstance(url, str):  # v3 returns {"Error": ...} dict on failure
+                log.error("scrip master %s error: %s", segment, url)
+                return {}
             resp = requests.get(url, timeout=30, verify=False)  # noqa: S501 (broker file, cert quirk)
             resp.raise_for_status()
             df = pd.read_csv(io.StringIO(resp.text), dtype=str).fillna("")
@@ -111,7 +120,7 @@ class KotakService:
                 out.add(m.group(3))
         return sorted(out, key=lambda s: int(s))
 
-    # ---------- orders ----------
+    # ---------- orders (kwargs limited to v3 place_order signature) ----------
     def place_order(self, **kw):
         client = self._require()
         log.info("place_order %s", kw)
@@ -127,16 +136,7 @@ class KotakService:
             amo=kw.get("amo", "NO"),
             trigger_price=str(kw.get("trigger_price", "0")),
             disclosed_quantity=str(kw.get("disclosed_quantity", "0")),
-            market_protection=str(kw.get("market_protection", "0")),
-            pf=kw.get("pf", "N"),
-            scrip_token=kw.get("scrip_token"),
-            square_off_type=kw.get("square_off_type"),
-            stop_loss_type=kw.get("stop_loss_type"),
-            stop_loss_value=kw.get("stop_loss_value"),
-            square_off_value=kw.get("square_off_value"),
-            last_traded_price=kw.get("last_traded_price"),
-            trailing_stop_loss=kw.get("trailing_stop_loss"),
-            trailing_sl_value=kw.get("trailing_sl_value"),
+            tag=kw.get("tag"),
         )
 
     def place_stop_loss(self, exchange_segment: str, quantity: str, trading_symbol: str, trigger_price: str):
@@ -150,17 +150,26 @@ class KotakService:
                                 order_type="MKT", price="", quantity=quantity,
                                 trading_symbol=trading_symbol, transaction_type="S")
 
-    def modify_sl(self, order_id: str, new_trigger: str):
+    def modify_sl(self, order_id: str, quantity: str, new_trigger: str):
+        """v3 modify_order REQUIRES quantity — pass the leg's original qty."""
         client = self._require()
-        return client.modify_order(order_id=str(order_id), trigger_price=str(new_trigger),
-                                   price=str(float(new_trigger) - 1), order_type="SL", validity="DAY")
+        return client.modify_order(order_id=str(order_id),
+                                   price=str(float(new_trigger) - 1),
+                                   order_type="SL",
+                                   quantity=str(quantity),
+                                   validity="DAY",
+                                   trigger_price=str(new_trigger))
 
     def cancel(self, order_id: str):
         client = self._require()
         return client.cancel_order(order_id=str(order_id))
 
-    def order_history(self):
-        return self._require().order_history()
+    def order_book(self):
+        """Full day order book (v3: order_report; order_history needs one order_id)."""
+        return self._require().order_report()
+
+    def order_history(self, order_id: str):
+        return self._require().order_history(order_id=str(order_id))
 
     # ---------- positions (same aggregation as TransTrader.get_positions) ----------
     def positions(self) -> dict:
@@ -169,7 +178,7 @@ class KotakService:
         except Exception as e:
             log.error("positions call failed: %s", e)
             return {}
-        if raw.get("stCode") != 200 or not raw.get("data"):
+        if not isinstance(raw, dict) or raw.get("stCode") != 200 or not raw.get("data"):
             return {}
         df = pd.DataFrame(raw["data"])
         num_cols = ["cfBuyQty", "flBuyQty", "cfSellQty", "flSellQty", "cfBuyAmt", "buyAmt",

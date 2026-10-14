@@ -7,10 +7,13 @@ Phase 2 hook: `backend/app/synthetic_engine.py::on_tick` is where algo triggers 
 
 ## Feature parity with TransTrader (PyQt)
 - Single CE / PE buy + **Buy-Both straddle** (MKT / ML / L-1 / L entry modes, same +5/-1 emulation)
-- **Synthetic BO**: entry fill → auto SL; target hit → market-exit (cancel SL + MKT sell) **or** trailing-stop ratchet
-- **Native BO/CO** passthrough (`product=BO` + square_off/stop_loss values) when the exchange accepts it
+- **Synthetic BO** (SDK v3 exposes no native BO kwargs): entry fill → auto SL; target hit → market-exit
+  (cancel SL + MKT sell) **or** trailing-stop ratchet
 - Live price ticks + order feed over one `/ws` socket; positions poll; cancel / modify-SL
-- Strike picker helper (NIFTY step 50, SENSEX step 100)
+- Expiry dropdown + strike picker from scrip master (NIFTY step 50, SENSEX step 100 fallback)
+
+> SDK: PyPI **`kotakneoapi` ≥ 3.0.7** (same as SwingTrader) — *not* the old `neo-api-client` 2.x package
+> TransTrader uses. `backend/tests/test_sdk_compat.py` pins our calls to the v3 signatures.
 
 ## Security (unauthorized-access hardening)
 1. **AWS SG + UFW**: only YOUR home IP → 22/80/443 (`deploy/ec2-setup.sh`).
@@ -20,12 +23,12 @@ Phase 2 hook: `backend/app/synthetic_engine.py::on_tick` is where algo triggers 
 5. **Kotak creds server-side only**: consumer key / UCC / MPIN in EC2 `.env`, never in git or the browser.
    Morning login = app login → click *Kotak TOTP login* → type live TOTP (same as TransTrader OTP step).
 
-## Quickstart (local)
+## Quickstart (local, uv)
 ```powershell
 Copy-Item .env.example .env   # fill secrets; hash password first
 # backend
-cd backend; python -m venv .venv; .\.venv\Scripts\Activate.ps1
-pip install -r requirements.txt; uvicorn app.main:app --reload
+cd backend; uv sync; uv run uvicorn app.main:app --reload
+uv run --group dev pytest tests/ -q   # SDK compat checks
 # frontend (new shell)
 cd frontend; npm install; npm run dev   # http://localhost:5173
 ```

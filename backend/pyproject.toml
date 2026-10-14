@@ -1,0 +1,25 @@
+[project]
+name = "kotak-trader-backend"
+version = "0.1.0"
+description = "KotakAPI Trader backend — manual web trading interface on Kotak Neo SDK v3"
+readme = "../README.md"
+requires-python = ">=3.12"
+dependencies = [
+  "fastapi>=0.115,<0.117",
+  "uvicorn[standard]>=0.30,<0.35",
+  "pydantic-settings>=2,<3",
+  "python-jose[cryptography]>=3.3",
+  "passlib[bcrypt]>=1.7",
+  "httpx>=0.27,<0.29",
+  "pandas>=2.2,<3",
+  "requests>=2.32",
+  "urllib3>=2.2",
+  "kotakneoapi>=3.0.7",
+  "python-multipart>=0.0.12",
+]
+
+[dependency-groups]
+dev = ["pytest>=8"]
+
+[tool.uv]
+package = false

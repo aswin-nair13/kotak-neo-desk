@@ -27,11 +27,9 @@ class SingleOrderBody(BaseModel):
     stop_points: float = 10
     strategy: Literal["market_exit", "trailing_stop"] = "market_exit"
     trail_distance: float = 5.0
-    # native BO passthrough (optional — only sent if product == BO)
-    product: Literal["MIS", "BO", "CO", "NRML"] = "MIS"
-    bo_square_off: float | None = None
-    bo_stop_loss: float | None = None
-    bo_trailing: str | None = None  # 'Y'/'N'
+    # SDK v3 place_order has no BO/CO kwargs — bracket behaviour is synthetic
+    # (entry + auto SL + target/trailing via SyntheticEngine), so MIS/NRML only.
+    product: Literal["MIS", "NRML", "CNC"] = "MIS"
 
 
 class StraddleBody(BaseModel):
@@ -45,4 +43,4 @@ class StraddleBody(BaseModel):
     stop_points: float = 10
     strategy: Literal["market_exit", "trailing_stop"] = "market_exit"
     trail_distance: float = 5.0
-    product: Literal["MIS", "BO"] = "MIS"
+    product: Literal["MIS", "NRML", "CNC"] = "MIS"
