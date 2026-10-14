@@ -29,6 +29,8 @@ if not settings.app_password_bcrypt:
 if settings.jwt_secret == "change-me":
     log.warning("JWT_SECRET is still the default — set a random 32+ char value in .env.")
 
+BUILD = "bb3a452+verify"
+
 app = FastAPI(title="KotakAPI Trader")
 app.add_middleware(IPAllowlistMiddleware)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True,
@@ -54,7 +56,7 @@ app.include_router(market_routes.router, prefix="/api/market", tags=["market"])
 
 @app.get("/api/health")
 def health():
-    return {"ok": True, "kotak_logged_in": kotak.logged_in,
+    return {"ok": True, "build": BUILD, "kotak_logged_in": kotak.logged_in,
             "synthetic_open": len([o for o in engine.all() if o["status"] not in ("CLOSED",)])}
 
 

@@ -55,3 +55,11 @@ def kotak_complete(body: KotakCompleteBody):
 def kotak_status():
     assert kotak is not None
     return {"logged_in": kotak.logged_in}
+
+
+@router.get("/kotak/verify", dependencies=[Depends(require_user)])
+def kotak_verify():
+    """Session-gated probe (margin/limits). ok=true means OMS accepts this session;
+    ok=false with 401 detail means the TOTP/MPIN login is dead despite looking live."""
+    assert kotak is not None
+    return kotak.session_check()

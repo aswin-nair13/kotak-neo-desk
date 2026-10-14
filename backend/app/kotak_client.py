@@ -68,6 +68,7 @@ class KotakService:
     def complete_login(self, mobile: str, ucc: str, totp: str, mpin: str):
         if not self.pending_client:
             raise ValueError("Call initiate_login first")
+        mobile, ucc, totp, mpin = (s.strip() for s in (mobile, ucc, totp, mpin))
         self._assert_session_ok(
             self.pending_client.totp_login(mobile_number=mobile, ucc=ucc, totp=totp),
             "TOTP login (check the 6-digit code is current)")
@@ -189,6 +190,17 @@ class KotakService:
 
     def order_history(self, order_id: str):
         return self._require().order_history(order_id=str(order_id))
+
+    def session_check(self) -> dict:
+        """Lightweight session-gated call (margin/limits need a trading session).
+        Distinguishes 'session dead' (401 here too) from 'orders specifically broken'."""
+        try:
+            res = self._require().limits()
+        except Exception as e:
+            return {"ok": False, "detail": str(e)[:300]}
+        if isinstance(res, dict) and res.get("stat") == "Ok":
+            return {"ok": True}
+        return {"ok": False, "detail": str(res)[:300]}
 
     def quote_ltp(self, trading_symbol: str, exchange: str) -> float | None:
         """Live LTP for one F&O symbol via v3 quotes(). Returns None on any failure."""
