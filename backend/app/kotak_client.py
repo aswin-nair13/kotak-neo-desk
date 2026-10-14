@@ -53,11 +53,30 @@ class KotakService:
         self.pending_client = NeoAPI(consumer_key=self.consumer_key, environment="prod")
         return True
 
+    @staticmethod
+    def _assert_session_ok(resp, step: str):
+        """v3 totp calls return error dicts instead of raising — a bad/stale TOTP
+        would otherwise look like a live session until the first order 401s."""
+        if isinstance(resp, dict) and isinstance(resp.get("data"), dict):
+            return resp["data"]
+        detail = ""
+        if isinstance(resp, dict):
+            detail = (resp.get("errMsg") or resp.get("message")
+                      or resp.get("Error") or resp.get("stat") or str(resp)[:200])
+        raise RuntimeError(f"{step} failed: {detail or 'no session data returned'}")
+
     def complete_login(self, mobile: str, ucc: str, totp: str, mpin: str):
         if not self.pending_client:
             raise ValueError("Call initiate_login first")
-        self.pending_client.totp_login(mobile_number=mobile, ucc=ucc, totp=totp)
-        self.pending_client.totp_validate(mpin=mpin)
+        self._assert_session_ok(
+            self.pending_client.totp_login(mobile_number=mobile, ucc=ucc, totp=totp),
+            "TOTP login (check the 6-digit code is current)")
+        self._assert_session_ok(
+            self.pending_client.totp_validate(mpin=mpin),
+            "MPIN validation (check KOTAK_MPIN in .env)")
+        cfg = getattr(getattr(self.pending_client, "api_client", None), "configuration", None)
+        if not getattr(cfg, "edit_token", None):
+            raise RuntimeError("MPIN validation returned no trading token — login incomplete")
         self.client = self.pending_client
         self.pending_client = None
         self.login_date = date.today()

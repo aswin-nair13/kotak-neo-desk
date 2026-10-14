@@ -73,6 +73,29 @@ def test_login_signatures():
     inspect.signature(NeoAPI.totp_validate).bind(object(), mpin="m")
 
 
+def test_complete_login_rejects_bad_totp():
+    """Regression: v3 returns error dicts (no raise) — must not mark session live."""
+    s = KotakService(consumer_key="dummy")
+    fake = MagicMock()
+    fake.totp_login.return_value = {"stat": "Not_Ok", "stCode": 100001,
+                                    "errMsg": "Invalid totp"}
+    s.pending_client = fake
+    with pytest.raises(RuntimeError, match="TOTP login"):
+        s.complete_login("m", "u", "000000", "1234")
+    assert s.client is None and not s.logged_in
+
+
+def test_complete_login_rejects_bad_mpin():
+    s = KotakService(consumer_key="dummy")
+    fake = MagicMock()
+    fake.totp_login.return_value = {"stat": "Ok", "data": {"token": "v", "sid": "s"}}
+    fake.totp_validate.return_value = {"stat": "Not_Ok", "errMsg": "Invalid mpin"}
+    s.pending_client = fake
+    with pytest.raises(RuntimeError, match="MPIN"):
+        s.complete_login("m", "u", "123456", "0000")
+    assert s.client is None and not s.logged_in
+
+
 def test_quote_uses_v3_quotes(svc):
     s, fake = svc
     s.nse_fo_tokens = {"NIFTY25N1825450CE": "99999"}
