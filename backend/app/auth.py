@@ -12,7 +12,7 @@ from datetime import datetime, timedelta, timezone
 from fastapi import Depends, HTTPException, Request, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from jose import JWTError, jwt
-from passlib.context import CryptContext
+import bcrypt
 from starlette.middleware.base import BaseHTTPMiddleware
 
 import fnmatch
@@ -22,14 +22,20 @@ import time
 
 from .config import ALLOWLIST, settings
 
-pwd_ctx = CryptContext(schemes=["bcrypt"], deprecated="auto")
 bearer = HTTPBearer(auto_error=False)
+
+
+def hash_app_password(plain: str) -> str:
+    return bcrypt.hashpw(plain.encode(), bcrypt.gensalt()).decode()
 
 
 def verify_app_password(plain: str) -> bool:
     if not settings.app_password_bcrypt:
         return False
-    return pwd_ctx.verify(plain, settings.app_password_bcrypt)
+    try:
+        return bcrypt.checkpw(plain.encode(), settings.app_password_bcrypt.strip().encode())
+    except (ValueError, AttributeError):
+        return False
 
 
 def create_token() -> str:
