@@ -1,0 +1,12 @@
+# Fresh EC2 with no domain: Caddy serves HTTPS on first boot via self-signed fallback?
+# Easiest path until you have a domain: access via http://<EC2-IP> behind IP whitelist + app login,
+# then switch the site line below to your domain for auto Let's Encrypt.
+# Replace :80 with your.domain.com once DNS points at the EC2 elastic IP.
+
+:80 {
+	reverse_proxy app:8000
+}
+# Example with domain (uncomment, comment the :80 block):
+# your.domain.com {
+# 	reverse_proxy app:8000
+# }

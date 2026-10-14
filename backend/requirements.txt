@@ -1,0 +1,11 @@
+fastapi==0.115.*
+uvicorn[standard]==0.30.*
+pydantic-settings==2.*
+python-jose[cryptography]==3.3.*
+passlib[bcrypt]==1.7.*
+httpx==0.27.*
+pandas==2.2.*
+requests==2.32.*
+urllib3==2.2.*
+neo-api-client==2.*
+python-multipart==0.0.12
