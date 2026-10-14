@@ -65,16 +65,37 @@ class KotakService:
                       or resp.get("Error") or resp.get("stat") or str(resp)[:200])
         raise RuntimeError(f"{step} failed: {detail or 'no session data returned'}")
 
+    @staticmethod
+    def _summarize(resp) -> str:
+        """Safe one-line summary for logs — keys and status flags only, never tokens."""
+        if not isinstance(resp, dict):
+            return f"non-dict {type(resp).__name__}"
+        d = resp.get("data")
+        keys = sorted(d.keys()) if isinstance(d, dict) else None
+        masked = {k: ("<present>" if k in ("token", "sid", "rid") else d.get(k))
+                  for k in ("status", "stat", "stCode", "isUserPwdExpired",
+                            "dormancyStatus", "isTrialAccount", "ucc") if isinstance(d, dict)}
+        return (f"stat={resp.get('stat')} err={resp.get('errMsg') or resp.get('Error')} "
+                f"data_status={masked.get('status')} data_keys={keys} flags={masked}")
+
     def complete_login(self, mobile: str, ucc: str, totp: str, mpin: str):
         if not self.pending_client:
             raise ValueError("Call initiate_login first")
         mobile, ucc, totp, mpin = (s.strip() for s in (mobile, ucc, totp, mpin))
-        self._assert_session_ok(
-            self.pending_client.totp_login(mobile_number=mobile, ucc=ucc, totp=totp),
-            "TOTP login (check the 6-digit code is current)")
-        self._assert_session_ok(
-            self.pending_client.totp_validate(mpin=mpin),
-            "MPIN validation (check KOTAK_MPIN in .env)")
+        r1 = self.pending_client.totp_login(mobile_number=mobile, ucc=ucc, totp=totp)
+        log.info("totp_login %s", self._summarize(r1))
+        self._assert_session_ok(r1, "TOTP login (check the 6-digit code is current)")
+        r2 = self.pending_client.totp_validate(mpin=mpin)
+        log.info("totp_validate %s", self._summarize(r2))
+        data = self._assert_session_ok(r2, "MPIN validation (check KOTAK_MPIN in .env)")
+        # data.status can be "failed" even with a data body (e.g. expired password,
+        # unaccepted risk disclosure) — tokens from such a session are rejected by OMS.
+        if str(data.get("status", "success")).lower() != "success":
+            raise RuntimeError(
+                f"Login not completed (status={data.get('status')}). "
+                f"isUserPwdExpired={data.get('isUserPwdExpired')} "
+                f"dormancy={data.get('dormancyStatus')}. "
+                "Check the NEO app for pending password change / disclosures / KYC.")
         cfg = getattr(getattr(self.pending_client, "api_client", None), "configuration", None)
         if not getattr(cfg, "edit_token", None):
             raise RuntimeError("MPIN validation returned no trading token — login incomplete")
