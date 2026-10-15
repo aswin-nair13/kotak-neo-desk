@@ -180,26 +180,54 @@ class KotakService:
             tag=kw.get("tag"),
         )
 
-    def place_stop_loss(self, exchange_segment: str, quantity: str, trading_symbol: str, trigger_price: str):
-        return self.place_order(exchange_segment=exchange_segment, product="MIS",
+    def place_stop_loss(self, exchange_segment: str, quantity: str, trading_symbol: str,
+                          trigger_price: str, transaction_type: str = "S", product: str = "MIS"):
+        """Protective SL opposite to the entry side.
+
+        Long entry (B) -> SELL SL with limit just under trigger.
+        Short entry (S) -> BUY SL with limit just over trigger.
+        The old code always used trigger-1.00 with @0.00-style fills, which the
+        exchange rejects with 'STOP PRICE IS NOT REASONABLE' when the trigger is
+        negative/small (cheap premium minus fixed stop distance) or the 1.00 gap
+        is huge vs the premium. Offset is now tick-aware and floored at 0.05.
+        """
+        trig = float(trigger_price)
+        if trig <= 0:
+            trig = 0.05
+        limit = self.sl_limit_price(trig, transaction_type)
+        return self.place_order(exchange_segment=exchange_segment, product=product,
                                 order_type="SL", quantity=quantity, trading_symbol=trading_symbol,
-                                transaction_type="S", trigger_price=trigger_price,
-                                price=str(float(trigger_price) - 1))
+                                transaction_type=transaction_type,
+                                trigger_price=f"{trig:.2f}",
+                                price=f"{limit:.2f}")
 
-    def place_market_exit(self, exchange_segment: str, quantity: str, trading_symbol: str):
-        return self.place_order(exchange_segment=exchange_segment, product="MIS",
+    @staticmethod
+    def sl_limit_price(trigger: float, transaction_type: str = "S") -> float:
+        """Tick-aware SL limit: SELL -> just under trigger, BUY -> just over."""
+        trig = max(0.05, float(trigger))
+        offset = 0.5 if trig < 50 else 1.0
+        if transaction_type == "B":
+            return round(trig + offset, 2)
+        return round(max(0.05, trig - offset), 2)
+
+    def place_market_exit(self, exchange_segment: str, quantity: str, trading_symbol: str,
+                          transaction_type: str = "S", product: str = "MIS"):
+        return self.place_order(exchange_segment=exchange_segment, product=product,
                                 order_type="MKT", price="", quantity=quantity,
-                                trading_symbol=trading_symbol, transaction_type="S")
+                                trading_symbol=trading_symbol, transaction_type=transaction_type)
 
-    def modify_sl(self, order_id: str, quantity: str, new_trigger: str):
+    def modify_sl(self, order_id: str, quantity: str, new_trigger: str,
+                  transaction_type: str = "S"):
         """v3 modify_order REQUIRES quantity — pass the leg's original qty."""
         client = self._require()
+        trig = max(0.05, float(new_trigger))
+        limit = self.sl_limit_price(trig, transaction_type)
         return client.modify_order(order_id=str(order_id),
-                                   price=str(float(new_trigger) - 1),
+                                   price=f"{limit:.2f}",
                                    order_type="SL",
                                    quantity=str(quantity),
                                    validity="DAY",
-                                   trigger_price=str(new_trigger))
+                                   trigger_price=f"{trig:.2f}")
 
     def cancel(self, order_id: str):
         client = self._require()
@@ -304,7 +332,24 @@ class KotakService:
         for sym, g in df.groupby("trdSym"):
             q = float(g["net_qty"].sum())
             if q:
-                out[sym] = {"qty": q, "avg_prc": round(float(g["avg_prc"].mean()), 2)}
+                lot = 0
+                try:
+                    lot = int(float(g["lotSz"].iloc[0])) or 0
+                except (TypeError, ValueError, IndexError):
+                    lot = 0
+                ex = str(g["exSeg"].iloc[0]) if "exSeg" in g.columns else ""
+                prod = ""
+                for c in ("prod", "product", "prd"):
+                    if c in g.columns:
+                        try:
+                            prod = str(g[c].iloc[0] or "")
+                            if prod:
+                                break
+                        except IndexError:
+                            pass
+                out[sym] = {"qty": q, "avg_prc": round(float(g["avg_prc"].mean()), 2),
+                            "qty_shares": int(round(abs(q) * (lot or 0))),
+                            "exchange": ex, "lot_sz": lot, "product": prod or "MIS"}
         return out
 
     # ---------- strike helper (TransTrader logic) ----------

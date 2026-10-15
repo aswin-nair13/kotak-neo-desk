@@ -61,6 +61,7 @@ orders_routes.engine = engine
 orders_routes.hub = hub
 orders_routes.bridge = bridge
 market_routes.kotak = kotak
+market_routes.bridge = bridge
 
 app.include_router(auth_routes.router, prefix="/api/auth", tags=["auth"])
 app.include_router(orders_routes.router, prefix="/api/orders", tags=["orders"])

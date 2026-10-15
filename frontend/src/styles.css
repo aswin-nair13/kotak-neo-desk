@@ -80,6 +80,8 @@ body {
 .btn:disabled { opacity: 0.45; cursor: not-allowed; }
 .btn.buy { background: #238636; border-color: #238636; }
 .btn.buy:hover:not(:disabled) { background: #2ea043; }
+.btn.sell { background: #a40e26; border-color: #a40e26; }
+.btn.sell:hover:not(:disabled) { background: #da3633; }
 .btn.ghost { background: transparent; border-color: var(--border); color: var(--text); }
 .btn.sm { padding: 6px 12px; font-size: 12.5px; }
 .ltp { font-size: 13px; font-weight: 700; color: var(--amber); font-variant-numeric: tabular-nums; min-width: 64px; }
@@ -116,6 +118,11 @@ table.tbl { width: 100%; border-collapse: collapse; font-size: 13px; }
 .ord .side-S { color: var(--red); font-weight: 700; }
 .ord .status { margin-left: auto; font-weight: 700; font-size: 12px; }
 .ord .reason { flex-basis: 100%; color: var(--muted); font-style: italic; font-size: 12px; }
+.ord .lat {
+  font-size: 12px; font-weight: 700; color: var(--amber);
+  background: #3b2f0b66; border: 1px solid #d2992244;
+  padding: 1px 8px; border-radius: 999px; font-variant-numeric: tabular-nums;
+}
 .ord.s-complete, .ord.s-filled { border-left-color: var(--green); }
 .ord.s-complete .status, .ord.s-filled .status { color: var(--green); }
 .ord.s-rejected { border-left-color: var(--red); }

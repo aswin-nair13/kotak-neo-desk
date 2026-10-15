@@ -10,6 +10,7 @@ synthetic engine, using TransTrader-shaped dicts throughout.
 import asyncio
 import logging
 import threading
+import time
 
 log = logging.getLogger("sfeed")
 
@@ -35,7 +36,8 @@ def map_feed_message(msg) -> dict | None:
 
 
 def map_order_data(d) -> dict:
-    """OrderUpdate.data -> TransTrader-style order dict for engine + UI."""
+    """OrderUpdate.data -> TransTrader-style order dict for engine + UI.
+    t_feed_ms stamps server receipt of the exchange update (click-to-fill math)."""
     tx = getattr(d, "transaction_type", "?")
     return {
         "nOrdNo": str(getattr(d, "order_id", "")),
@@ -47,6 +49,7 @@ def map_order_data(d) -> dict:
         "prc": str(getattr(d, "average_price", "0")),
         "fldQty": getattr(d, "filled_quantity", 0),
         "rejRsn": str(getattr(d, "reject_reason", None) or getattr(d, "rejRsn", None) or "--"),
+        "t_feed_ms": int(time.time() * 1000),
     }
 
 

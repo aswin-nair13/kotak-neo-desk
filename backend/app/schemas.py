@@ -27,6 +27,8 @@ class SingleOrderBody(BaseModel):
     stop_points: float = 10
     strategy: Literal["market_exit", "trailing_stop"] = "market_exit"
     trail_distance: float = 5.0
+    # side: B = buy (long), S = sell / short. SL + exits auto-invert for shorts.
+    side: Literal["B", "S"] = "B"
     # SDK v3 place_order has no BO/CO kwargs — bracket behaviour is synthetic
     # (entry + auto SL + target/trailing via SyntheticEngine), so MIS/NRML only.
     product: Literal["MIS", "NRML", "CNC"] = "MIS"
@@ -43,4 +45,24 @@ class StraddleBody(BaseModel):
     stop_points: float = 10
     strategy: Literal["market_exit", "trailing_stop"] = "market_exit"
     trail_distance: float = 5.0
+    # side applies to both legs: B = buy straddle, S = sell straddle.
+    side: Literal["B", "S"] = "B"
     product: Literal["MIS", "NRML", "CNC"] = "MIS"
+
+
+class WatchLeg(BaseModel):
+    instrument: Literal["NIFTY", "SENSEX"] = "NIFTY"
+    expiry: str = ""
+    strike: str = ""
+    option_type: Literal["CE", "PE"] = "CE"
+
+
+class WatchBody(BaseModel):
+    legs: list[WatchLeg] = []
+
+
+class ExitBody(BaseModel):
+    symbol: str = Field(min_length=3, max_length=60)
+    # product defaults to the tracked leg's product (or broker position's),
+    # override only if you moved the position across products.
+    product: str | None = None
