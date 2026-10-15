@@ -109,3 +109,14 @@ def batch_quotes(body: WatchBody):
 def positions():
     assert kotak is not None
     return {"positions": kotak.positions()}
+
+
+@router.post("/masters/refresh", dependencies=[Depends(require_user)])
+def refresh_masters():
+    """Re-download the scrip masters (Plan 02 C5). Clears the 'unavailable'
+    state on success so the UI can re-enable order entry after a transient
+    TLS/network failure at login."""
+    assert kotak is not None
+    if not kotak.logged_in:
+        raise HTTPException(status_code=400, detail="Kotak session not live — log in first")
+    return kotak.refresh_masters()

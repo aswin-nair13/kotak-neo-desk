@@ -60,6 +60,20 @@ def _lot(instrument: str) -> int:
     return settings.sensex_lot if instrument == "SENSEX" else settings.nifty_lot
 
 
+def _require_master():
+    """Block order ENTRY when the scrip master is unavailable (Plan 02 C5).
+
+    Every order's instrument_token comes from the master; if it failed to load
+    (TLS/HTTP/parse, possibly MITM) the symbol would resolve to no/forged token.
+    Risk-reducing actions (cancel / modify-SL / exit-position) are NOT gated."""
+    assert kotak is not None
+    if not kotak.master_ok:
+        raise HTTPException(
+            status_code=503,
+            detail="Scrip master unavailable — trading disabled. Refresh the Kotak "
+                   "session so the scrip-master download succeeds before placing orders.")
+
+
 def _leg(instrument, expiry, option_type, strike, lots, mode, ref_ltp, entry_offset, side: str = "B",
          offset: float = 1.0, limit_price: float | None = None):
     """Derive the entry limit price. Entry modes, symmetric by side
@@ -164,6 +178,7 @@ def _place_tracked(exchange, symbol, qty, entry, body_target, body_stop, strateg
 @router.post("/single", dependencies=[Depends(require_user)])
 def place_single(body: SingleOrderBody, ref_ltp: float = 0):
     t_recv = _ms()
+    _require_master()
     ltp = ref_ltp or (hub.latest.get("__manual__", {}).get("ltp", 0) if hub else 0)
     if not ltp:
         # caller must pass ?ref_ltp=<live price from UI ticker>
@@ -187,6 +202,7 @@ def place_single(body: SingleOrderBody, ref_ltp: float = 0):
 @router.post("/straddle", dependencies=[Depends(require_user)])
 def place_straddle(body: StraddleBody, ce_ltp: float = 0, pe_ltp: float = 0):
     t_recv = _ms()
+    _require_master()
     if not (ce_ltp and pe_ltp):
         raise HTTPException(status_code=400, detail="Pass ?ce_ltp=&pe_ltp= from tickers")
     tag = (body.client_order_tag or "").strip() or None

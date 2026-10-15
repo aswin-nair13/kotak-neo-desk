@@ -83,6 +83,7 @@ export default function App() {
   const [loginErr, setLoginErr] = useState('')
   const [totp, setTotp] = useState('')
   const [kotakIn, setKotakIn] = useState(false)
+  const [masterOk, setMasterOk] = useState(false)
   const [kotakBusy, setKotakBusy] = useState(false)
   const [egressIp, setEgressIp] = useState(null)
   const [ticks, setTicks] = useState({})
@@ -276,12 +277,20 @@ export default function App() {
       setSynthetic(s.data.orders || [])
       setPositions(p.data.positions || {})
       setKotakIn(!!st.data.logged_in)
+      // Scrip master drives the symbol->token map behind every order; when it
+      // failed to load the server reports trading_enabled=false and we block entry.
+      setMasterOk(!!st.data.trading_enabled)
     } catch (e) {
       say('err', `Refresh failed: ${e.response?.data?.detail || e.message}`)
     }
   }
 
   const refresh = async (justLoggedIn = false) => {
+    // A failed scrip-master load disables trading; give Refresh a chance to
+    // re-download it before pulling status back in.
+    if (kotakIn && !masterOk) {
+      try { await api.post('/market/masters/refresh', {}, auth) } catch { /* surfaced via status */ }
+    }
     await refreshData()
     if (kotakIn || justLoggedIn) {
       try {
@@ -413,7 +422,7 @@ export default function App() {
   }
 
   /* ---- orders (buy AND sell) ---- */
-  const needTicket = !kotakIn || !f.expiry
+  const needTicket = !kotakIn || !masterOk || !f.expiry
 
   const place = async (otype, side = 'B') => {
     const label = side === 'S' ? 'Sell' : 'Buy'
@@ -617,6 +626,19 @@ export default function App() {
         </div>
       )}
 
+      {kotakIn && !masterOk && (
+        <div className="card" style={{ borderColor: '#c0392b' }}>
+          <h2>⚠ Scrip master unavailable — trading disabled</h2>
+          <p className="sub">
+            The symbol→token map failed to load (TLS / network / parse error), so orders
+            are blocked to avoid submitting contracts that resolve to no token.
+            Quote, positions and order feed still work. Press <b>Refresh</b> to retry the
+            download (if it keeps failing, check the server log for the exact TLS error
+            and optionally set <code className="inline">SCRIP_MASTER_CA_BUNDLE</code>).
+          </p>
+        </div>
+      )}
+
       {kotakIn && (
         <div className="card">
           <h2>Kotak session</h2>
@@ -634,9 +656,11 @@ export default function App() {
       <div className={`card ${needTicket ? 'disabled' : ''}`}>
         <h2>Order ticket — synthetic bracket</h2>
         <p className="sub">
-          {kotakIn
-            ? 'Entry fills → SL auto-placed from fill price. Target hit → market exit, or trailing SL if selected. Selection survives orders/refresh.'
-            : 'Connect the Kotak session above to enable trading.'}
+          {!kotakIn
+            ? 'Connect the Kotak session above to enable trading.'
+            : !masterOk
+              ? 'Trading disabled — scrip master unavailable (see banner above). Press Refresh to retry.'
+              : 'Entry fills → SL auto-placed from fill price. Target hit → market exit, or trailing SL if selected. Selection survives orders/refresh.'}
         </p>
         <div className="grid">
           <div className="field"><label>Instrument</label>

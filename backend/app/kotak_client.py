@@ -25,12 +25,22 @@ from datetime import date
 import pandas as pd
 import requests
 
+from .config import settings
+
 log = logging.getLogger("kotak")
 
 try:
     from neo_api_client import NeoAPI
 except ImportError:  # dev machine without SDK installed
     NeoAPI = None  # type: ignore
+
+
+class ScripMasterError(RuntimeError):
+    """Scrip-master download failed (TLS, HTTP, parse, or no URL).
+
+    Raised instead of silently returning an empty symbol->token map: that empty
+    map is what every order's instrument_token derives from, so a silent failure
+    would let orders/streams resolve to no token (or, under MITM, a forged one)."""
 
 
 class KotakService:
@@ -43,6 +53,9 @@ class KotakService:
         self.bse_fo_tokens: dict[str, str] = {}
         self.nse_fo_df = None
         self.bse_fo_df = None
+        # segment -> error string. Empty = masters loaded. Non-empty = trading is
+        # disabled (see master_ok) so orders can't resolve to a stale/forged map.
+        self.master_errors: dict[str, str] = {}
         # LTP cache: (exchange, symbol) -> (epoch_sec, ltp|None). Batch watchlist
         # polling refires every few seconds per leg; without this each poll is
         # N quote HTTP calls and Kotak answers 429 + dropped connections.
@@ -110,10 +123,14 @@ class KotakService:
         self.client = self.pending_client
         self.pending_client = None
         self.login_date = date.today()
-        self.nse_fo_tokens = self._scrip_master("nse_fo")
-        self.bse_fo_tokens = self._scrip_master("bse_fo")
-        log.info("Kotak login OK; scrip masters cached: NFO=%d BFO=%d",
-                 len(self.nse_fo_tokens), len(self.bse_fo_tokens))
+        self.nse_fo_tokens = self._load_master("nse_fo")
+        self.bse_fo_tokens = self._load_master("bse_fo")
+        if self.master_errors:
+            log.error("Kotak login OK but scrip master unavailable (%s) — trading "
+                      "disabled until a successful refresh", self.master_errors)
+        else:
+            log.info("Kotak login OK; scrip masters cached: NFO=%d BFO=%d",
+                     len(self.nse_fo_tokens), len(self.bse_fo_tokens))
         return True
 
     def _require(self):
@@ -128,24 +145,57 @@ class KotakService:
     _SYM_RE = re.compile(r"^(NIFTY|SENSEX|BANKNIFTY|FINNIFTY)(\d{2}[A-Z]\d{2})(\d+)(CE|PE|XX|CF|PF)$")
 
     def _scrip_master(self, segment: str) -> dict[str, str]:
+        """Download + parse one segment's scrip master. TLS is always verified:
+        the default trust store, or an explicit CA bundle via
+        SCRIP_MASTER_CA_BUNDLE. raises ScripMasterError on any failure — the
+        caller must not proceed with an empty symbol->token map."""
         client = self._require()
+        verify = settings.scrip_master_ca_bundle or True
         try:
             url = client.scrip_master(exchange_segment=segment)
             if not isinstance(url, str):  # v3 returns {"Error": ...} dict on failure
-                log.error("scrip master %s error: %s", segment, url)
-                return {}
-            resp = requests.get(url, timeout=30, verify=False)  # noqa: S501 (broker file, cert quirk)
+                raise ScripMasterError(f"broker returned no URL: {url}")
+            resp = requests.get(url, timeout=30, verify=verify)
             resp.raise_for_status()
             df = pd.read_csv(io.StringIO(resp.text), dtype=str).fillna("")
             out = dict(zip(df["pTrdSymbol"], df["pSymbol"]))
-            if segment == "nse_fo":
-                self.nse_fo_df = df
-            else:
-                self.bse_fo_df = df
-            return out
         except Exception as e:
-            log.error("scrip master %s failed: %s", segment, e)
+            log.error("scrip master %s failed (verify=%s): %s", segment, verify, e)
+            raise ScripMasterError(f"{segment}: {e}") from e
+        if segment == "nse_fo":
+            self.nse_fo_df = df
+        else:
+            self.bse_fo_df = df
+        return out
+
+    def _load_master(self, segment: str) -> dict[str, str]:
+        """_scrip_master with the failure recorded instead of raised, so login can
+        complete (read-only access) while master_ok stays false and orders block."""
+        try:
+            return self._scrip_master(segment)
+        except ScripMasterError as e:
+            self.master_errors[segment] = str(e)
             return {}
+
+    def refresh_masters(self) -> dict:
+        """Re-attempt both scrip-master downloads; clears errors on success."""
+        self.master_errors = {}
+        self.nse_fo_tokens = self._load_master("nse_fo")
+        self.bse_fo_tokens = self._load_master("bse_fo")
+        return self.master_status()
+
+    @property
+    def master_ok(self) -> bool:
+        """True only when the session is live and both scrip masters resolved.
+
+        Orders derive their instrument_token from these maps, so a missing/empty
+        map means orders would resolve to no token — trading must be blocked."""
+        return (self.logged_in and not self.master_errors
+                and bool(self.nse_fo_tokens) and bool(self.bse_fo_tokens))
+
+    def master_status(self) -> dict:
+        return {"ok": self.master_ok, "errors": dict(self.master_errors),
+                "nse_fo": len(self.nse_fo_tokens), "bse_fo": len(self.bse_fo_tokens)}
 
     def token_for(self, trading_symbol: str, exchange: str) -> str | None:
         m = self.bse_fo_tokens if exchange == "bse_fo" else self.nse_fo_tokens

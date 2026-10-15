@@ -34,6 +34,9 @@ class Settings(BaseSettings):
     kotak_mobile_number: str = ""
     kotak_ucc: str = ""
     kotak_mpin: str = ""
+    # Optional CA bundle (PEM path) for the scrip-master CSV download. Empty =
+    # the default certifi/OS trust store (TLS always verified — never disabled).
+    scrip_master_ca_bundle: str = ""
 
     default_product: str = "MIS"
     nifty_lot: int = 75

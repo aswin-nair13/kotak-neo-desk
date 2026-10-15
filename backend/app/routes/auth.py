@@ -46,7 +46,13 @@ def kotak_complete(body: KotakCompleteBody):
 @router.get("/kotak/status", dependencies=[Depends(require_user)])
 def kotak_status():
     assert kotak is not None
-    return {"logged_in": kotak.logged_in}
+    out = {"logged_in": kotak.logged_in}
+    if kotak.logged_in:
+        # Scrip-master health drives trading_enabled (Plan 02 C5): the UI blocks
+        # order entry when the symbol->token map failed to load.
+        out["scrip_master"] = kotak.master_status()
+        out["trading_enabled"] = kotak.master_ok
+    return out
 
 
 @router.get("/kotak/verify", dependencies=[Depends(require_user)])

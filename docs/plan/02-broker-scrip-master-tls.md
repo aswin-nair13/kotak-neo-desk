@@ -1,6 +1,9 @@
 # Plan 02 — Broker Scrip-Master TLS Verification (C5)
 
-Status: **NOT IMPLEMENTED** · Priority: P1 · Scope: `backend/app/kotak_client.py`
+Status: **IMPLEMENTED** (verify=True by default with optional
+`SCRIP_MASTER_CA_BUNDLE`; failures recorded and surfaced as a
+trading-disabled state that blocks order entry) · Priority: P1 · Scope:
+`backend/app/kotak_client.py`
 
 ## Problem
 `kotak_client.py:137`:
