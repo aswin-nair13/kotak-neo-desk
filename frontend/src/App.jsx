@@ -300,6 +300,11 @@ export default function App() {
   }, [spot > 0, kotakIn, f.expiry])
 
   /* ---- watchlist websocket subscription + REST fallback quotes ---- */
+  // /watch is cheap (deduped server-side); /batch-quotes hits Kotak REST which
+  // rate-limits hard (429 + dropped connections), so REST is throttled: fresh
+  // fetch only when a leg lacks any price or the last fetch is >15s old.
+  // Live ticks on the websocket are the primary price source regardless.
+  const lastBatchRef = useRef(0)
   useEffect(() => {
     if (!kotakIn || !f.expiry || !legs.length) return
     const body = {
@@ -309,6 +314,12 @@ export default function App() {
       })),
     }
     api.post('/market/watch', body, auth).catch(() => {})
+    const missing = legs.some((l) => {
+      const s = symOf(f.instrument, f.expiry, l.strike, l.otype)
+      return (ticks[s]?.ltp ?? ticks[s]?.iv ?? px[s]) == null
+    })
+    if (!missing && Date.now() - lastBatchRef.current < 15000) return
+    lastBatchRef.current = Date.now()
     api.post('/market/batch-quotes', body, auth).then((r) => {
       const ltps = r.data.ltps || {}
       setPx((prev) => ({ ...prev, ...ltps }))

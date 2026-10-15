@@ -61,6 +61,7 @@ class SFeedBridge:
         self.retry_sec = retry_sec
         self._lock = threading.Lock()
         self._wanted: set[tuple[str, str]] = set()  # (exchange, token) option legs
+        self._subscribed: set[tuple[str, str]] = set()  # wanted legs already on the live ws
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         self._loop: asyncio.AbstractEventLoop | None = None
@@ -82,16 +83,23 @@ class SFeedBridge:
 
     def stop(self):
         self._stop.set()
+        with self._lock:
+            self._subscribed.clear()  # next session resubscribes the full set
         th, self._thread = self._thread, None
         if th and th.is_alive():
             th.join(timeout=10)
 
     def ensure_option(self, exchange: str, token: str | None):
-        """Subscribe one more option leg (called when a tracked order is placed)."""
+        """Subscribe one more option leg (called when a tracked order is placed,
+        or when the UI watchlist changes). Already-streaming tokens are skipped —
+        without this every watchlist edit re-sent the whole set per leg."""
         if not token:
             return
+        key = (exchange, str(token))
         with self._lock:
-            self._wanted.add((exchange, str(token)))
+            self._wanted.add(key)
+            if key in self._subscribed:
+                return
             loop, ws = self._loop, self._ws
         if loop and ws and not self._stop.is_set():
             fut = asyncio.run_coroutine_threadsafe(self._subscribe_wanted(ws), loop)
@@ -146,11 +154,14 @@ class SFeedBridge:
     async def _subscribe_wanted(self, ws, extra=None):
         from neo_api_client.websocket.feed import WsToken
         with self._lock:
-            toks = [WsToken(ex, tk) for ex, tk in sorted(self._wanted)] + list(extra or [])
+            wanted = sorted(self._wanted)
+            toks = [WsToken(ex, tk) for ex, tk in wanted] + list(extra or [])
         if not toks:
             return
         try:
             await ws.subscribe_scrips(toks)
+            with self._lock:
+                self._subscribed.update(wanted)
             log.info("subscribed %d scrips", len(toks))
         except Exception as e:
             log.error("subscribe failed: %s", e)

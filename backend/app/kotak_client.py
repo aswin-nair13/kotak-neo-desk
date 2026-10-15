@@ -12,11 +12,14 @@ v3 notes (verified against installed kotakneoapi 3.0.7):
     solely from SyntheticEngine (synthetic_engine.py), not native BO product.
   - modify_order() REQUIRES quantity -> callers must pass it (tracked per leg).
   - full day order book = order_report(), NOT order_history() (needs an order_id).
+  - quotes REST is aggressively rate-limited (HTTP 429 + dropped connections):
+    quote_ltp() carries a short TTL cache so watchlist polling bursts cost ~zero.
 """
 
 import io
 import logging
 import re
+import time
 from datetime import date
 
 import pandas as pd
@@ -40,6 +43,11 @@ class KotakService:
         self.bse_fo_tokens: dict[str, str] = {}
         self.nse_fo_df = None
         self.bse_fo_df = None
+        # LTP cache: (exchange, symbol) -> (epoch_sec, ltp|None). Batch watchlist
+        # polling refires every few seconds per leg; without this each poll is
+        # N quote HTTP calls and Kotak answers 429 + dropped connections.
+        self._quote_cache: dict[tuple[str, str], tuple[float, float | None]] = {}
+        self.quote_ttl_sec: float = 8.0
 
     # ---------- session ----------
     @property
@@ -273,7 +281,19 @@ class KotakService:
             return {"ip": None, "detail": str(res)[:200]}
 
     def quote_ltp(self, trading_symbol: str, exchange: str) -> float | None:
-        """Live LTP for one F&O symbol via v3 quotes(). Returns None on any failure."""
+        """Live LTP for one F&O symbol via v3 quotes(). Returns None on any failure.
+        Results (including misses) are cached for quote_ttl_sec so UI polling
+        bursts don't trip Kotak's rate limiter."""
+        key = (exchange, trading_symbol)
+        now = time.time()
+        hit = self._quote_cache.get(key)
+        if hit is not None and now - hit[0] < self.quote_ttl_sec:
+            return hit[1]
+        ltp = self._quote_ltp_live(trading_symbol, exchange)
+        self._quote_cache[key] = (now, ltp)
+        return ltp
+
+    def _quote_ltp_live(self, trading_symbol: str, exchange: str) -> float | None:
         tok = self.token_for(trading_symbol, exchange)
         if not tok:
             log.warning("quote: no token for %s", trading_symbol)

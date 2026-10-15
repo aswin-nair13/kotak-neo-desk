@@ -31,10 +31,16 @@ class SyntheticEngine:
         return None
 
     def by_token(self, token: str) -> dict | None:
-        for o in self.orders.values():
-            if o.get("instrument_token") == str(token) and o.get("status") in ("ACTIVE", "TRAILING"):
-                return o
-        return None
+        legs = self.by_tokens(str(token))
+        return legs[0] if legs else None
+
+    def by_tokens(self, token: str) -> list[dict]:
+        """ALL working legs on an instrument token. Two entries on the same
+        strike share one token — every leg must be evaluated per tick, not
+        just the first found."""
+        return [o for o in self.orders.values()
+                if o.get("instrument_token") == str(token)
+                and o.get("status") in ("ACTIVE", "TRAILING")]
 
     def all(self) -> list[dict]:
         return list(self.orders.values())
@@ -180,9 +186,10 @@ class SyntheticEngine:
             ltp = float(ltp)
         except (TypeError, ValueError):
             return
-        syn = self.by_token(str(token))
-        if not syn:
-            return
+        for syn in self.by_tokens(str(token)):
+            self._eval_leg(syn, ltp)
+
+    def _eval_leg(self, syn: dict, ltp: float):
         strategy, status = syn.get("strategy"), syn.get("status")
         target = float(syn["target_price"])
         side = syn.get("side", "B")
