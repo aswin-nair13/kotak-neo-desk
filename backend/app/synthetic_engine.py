@@ -26,7 +26,7 @@ class SyntheticEngine:
         if oid in self.orders:
             return self.orders[oid]
         for o in self.orders.values():
-            if o.get("sl_order_id") == oid:
+            if o.get("sl_order_id") == oid or o.get("exit_order_id") == oid:
                 return o
         return None
 
@@ -131,6 +131,14 @@ class SyntheticEngine:
             syn["closed_at_ms"] = t_now
 
         elif oid == syn.get("sl_order_id") and status == "cancelled" and syn["status"] == "CLOSING":
+            # Kotak sends 'cancelled' for the SL more than once (confirm +
+            # status snapshot). Only the first may fire the market exit —
+            # otherwise we double-exit (flip the position!) or mark ERRORED
+            # on a harmless duplicate.
+            if syn.get("exit_order_id"):
+                log.info("duplicate SL cancel for %s ignored (exit %s already placed)",
+                         syn["trading_symbol"], syn.get("exit_order_id"))
+                return
             try:
                 side = syn.get("side", "B")
                 exit_txn = "B" if side == "S" else "S"
@@ -138,11 +146,26 @@ class SyntheticEngine:
                                                   syn["trading_symbol"],
                                                   transaction_type=exit_txn,
                                                   product=syn.get("product", "MIS"))
-                if not (r and r.get("stCode") == 200):
+                if r and r.get("stCode") == 200 and r.get("nOrdNo"):
+                    syn["exit_order_id"] = r.get("nOrdNo")
+                else:
                     syn["status"] = "ERRORED"
+                    syn["error"] = f"market exit rejected: {str(r)[:300]}"
+                    log.error("market exit rejected for %s: %s", syn["trading_symbol"], r)
             except Exception as e:
                 log.error("market exit failed: %s", e)
                 syn["status"] = "ERRORED"
+                syn["error"] = str(e)[:300]
+
+        elif oid == syn.get("exit_order_id"):
+            if status == "complete":
+                syn["status"] = "CLOSED"
+                syn["closed_at_ms"] = t_now
+            elif "reject" in status:
+                syn["status"] = "ERRORED"
+                syn["error"] = f"exit {oid} rejected: {od.get('rejRsn', '')}"
+                log.error("exit order %s (%s) rejected: %s",
+                          oid, syn["trading_symbol"], od.get("rejRsn", ""))
 
         elif status == "complete" and syn["status"] == "CLOSING":
             syn["status"] = "CLOSED"

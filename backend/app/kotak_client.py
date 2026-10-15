@@ -212,8 +212,11 @@ class KotakService:
 
     def place_market_exit(self, exchange_segment: str, quantity: str, trading_symbol: str,
                           transaction_type: str = "S", product: str = "MIS"):
+        # MKT legs must carry price "0" — an empty string is rejected by OMS
+        # (this silently killed every synthetic target-exit and Exit-button
+        # flatten: order accepted then never fills / rejected downstream).
         return self.place_order(exchange_segment=exchange_segment, product=product,
-                                order_type="MKT", price="", quantity=quantity,
+                                order_type="MKT", price="0", quantity=quantity,
                                 trading_symbol=trading_symbol, transaction_type=transaction_type)
 
     def modify_sl(self, order_id: str, quantity: str, new_trigger: str,

@@ -1,5 +1,6 @@
 """Order endpoints: single leg, straddle (CE+PE), cancel/modify, synthetic list, orderbook."""
 
+import logging
 import time
 
 from fastapi import APIRouter, Depends, HTTPException
@@ -10,6 +11,8 @@ from ..kotak_client import KotakService
 from ..schemas import ExitBody, SingleOrderBody, StraddleBody
 from ..synthetic_engine import SyntheticEngine
 from ..ws_manager import Hub
+
+log = logging.getLogger("orders")
 
 router = APIRouter()
 
@@ -23,20 +26,48 @@ def _lot(instrument: str) -> int:
     return settings.sensex_lot if instrument == "SENSEX" else settings.nifty_lot
 
 
-def _leg(instrument, expiry, option_type, strike, lots, mode, ref_ltp, entry_offset):
+def _leg(instrument, expiry, option_type, strike, lots, mode, ref_ltp, entry_offset, side: str = "B",
+         offset: float = 1.0, limit_price: float | None = None):
+    """Derive the entry limit price. Entry modes, symmetric by side
+    (is_long True for BUY, False for SELL/short), with ref = live LTP:
+      MKT : marketable limit — BUY ref+5, SELL ref-5 (true MKT is rejected
+            for some F&O legs, so we fake it with a through-the-market limit)
+      ML  : limit at ref (both sides)
+      L-1 : passive limit with configurable offset —
+            BUY ref-offset (bid below), SELL ref+offset (offer above)
+      L   : explicit limit_price from the UI Limit column (both sides);
+            400 if missing/invalid. Legacy entry_offset fallback kept so old
+            clients sending L + entry_offset still work (ref - entry_offset).
+    """
     if not expiry:
         raise HTTPException(status_code=400, detail="Pick an expiry from GET /api/market/expiries")
+    is_long = str(side).upper() != "S"
     exchange = "bse_fo" if instrument == "SENSEX" else "nse_fo"
     symbol = f"{instrument}{expiry}{strike}{option_type}"
     qty = str(_lot(instrument) * lots)
     if mode == "L":
-        entry = float(ref_ltp) - float(entry_offset)
+        if limit_price is not None:
+            try:
+                entry = float(limit_price)
+            except (TypeError, ValueError):
+                raise HTTPException(status_code=400, detail=f"Limit price invalid for {symbol} (L mode needs a price)")
+            if entry <= 0:
+                raise HTTPException(status_code=400, detail=f"Limit price required for {symbol} (L mode, price missing)")
+        elif float(entry_offset or 0):
+            entry = float(ref_ltp) - float(entry_offset)
+        else:
+            raise HTTPException(status_code=400, detail=f"Limit price required for {symbol} (L mode, price missing)")
     elif mode == "ML":
         entry = float(ref_ltp)
     elif mode == "L-1":
-        entry = float(ref_ltp) - 1
-    else:  # MKT emulated as limit +5 (TransTrader behaviour — MKT rejected for some F&O legs)
+        d = float(offset if offset is not None else 1.0)
+        if d < 0:
+            raise HTTPException(status_code=400, detail=f"Offset must be >= 0 for {symbol}")
+        entry = float(ref_ltp) - d if is_long else float(ref_ltp) + d
+    elif is_long:
         entry = float(ref_ltp) + 5
+    else:  # SELL MKT: accept below last price so the short fills immediately
+        entry = float(ref_ltp) - 5
     return exchange, symbol, qty, entry
 
 
@@ -99,7 +130,8 @@ def place_single(body: SingleOrderBody, ref_ltp: float = 0):
         # caller must pass ?ref_ltp=<live price from UI ticker>
         raise HTTPException(status_code=400, detail="Pass ?ref_ltp=<current option LTP> (shown in ticket)")
     ex, sym, qty, entry = _leg(body.instrument, body.expiry, body.option_type, body.strike,
-                               body.lots, body.entry_mode, ltp, body.entry_offset)
+                               body.lots, body.entry_mode, ltp, body.entry_offset, body.side,
+                               body.offset, body.limit_price)
     return _place_tracked(ex, sym, qty, entry, body.target_points, body.stop_points,
                           body.strategy, body.trail_distance, body.product, body.side, t_recv)
 
@@ -111,7 +143,7 @@ def place_straddle(body: StraddleBody, ce_ltp: float = 0, pe_ltp: float = 0):
         raise HTTPException(status_code=400, detail="Pass ?ce_ltp=&pe_ltp= from tickers")
     out = []
     for otype, strike, ltp in (("CE", body.ce_strike, ce_ltp), ("PE", body.pe_strike, pe_ltp)):
-        ex, sym, qty, entry = _leg(body.instrument, body.expiry, otype, strike, body.lots, body.entry_mode, ltp, 0)
+        ex, sym, qty, entry = _leg(body.instrument, body.expiry, otype, strike, body.lots, body.entry_mode, ltp, 0, body.side)
         out.append(_place_tracked(ex, sym, qty, entry, body.target_points, body.stop_points,
                                   body.strategy, body.trail_distance, body.product, body.side, t_recv))
     return {"legs": out}
@@ -201,8 +233,14 @@ def exit_position(body: ExitBody):
         r = kotak.place_market_exit(exchange, str(shares), symbol,
                                     transaction_type=exit_txn, product=product)
     except Exception as e:
+        log.error("exit-position MKT failed for %s: %s", symbol, e)
         raise HTTPException(status_code=502, detail=f"Exit order failed for {symbol}: {e}")
     t_b1 = _ms()
+    if not (r and r.get("stCode") == 200):
+        # Log the full rejection server-side — the UI only shows a summary and
+        # the order-feed REJECTED row is the only other trace.
+        log.error("exit-position MKT rejected for %s (side=%s qty=%s product=%s): %s",
+                  symbol, exit_txn, shares, product, r)
     if not (r and r.get("stCode") == 200):
         raise HTTPException(status_code=502, detail=f"Exit rejected for {symbol}: {r}")
     return {"symbol": symbol, "exit_side": ("SELL" if exit_txn == "S" else "BUY"),

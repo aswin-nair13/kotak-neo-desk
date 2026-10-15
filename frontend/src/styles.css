@@ -94,7 +94,14 @@ body {
 
 /* tables */
 table.tbl { width: 100%; border-collapse: collapse; font-size: 13px; }
-.tbl th { text-align: left; color: var(--muted); font-weight: 600; font-size: 11px;
+.tbl input.mini, .tbl select.mini {
+  width: 62px; padding: 6px 8px; font-size: 13px;
+  background: #0d1117; color: var(--text);
+  border: 1px solid var(--border); border-radius: 7px; outline: none;
+}
+.tbl input.mini.wide { width: 84px; }
+.tbl input.mini:focus, .tbl select.mini:focus { border-color: var(--accent); }
+.tbl select.mini option { background: #161b22; color: var(--text); }.tbl th { text-align: left; color: var(--muted); font-weight: 600; font-size: 11px;
   text-transform: uppercase; letter-spacing: 0.6px; padding: 8px 10px; border-bottom: 1px solid var(--border); }
 .tbl td { padding: 8px 10px; border-bottom: 1px solid #21262d; font-variant-numeric: tabular-nums; }
 .tbl tr:last-child td { border-bottom: none; }

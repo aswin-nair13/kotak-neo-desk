@@ -5,6 +5,7 @@ const blank = {
   instrument: 'NIFTY', expiry: '', ce_strike: '', pe_strike: '',
   lots: 1, target_points: 20, stop_points: 10, trail_distance: 5,
   entry_mode: 'MKT', strategy: 'market_exit', product: 'MIS',
+  offset: 1, ce_limit: '', pe_limit: '',
 }
 
 const feedClass = (st = '') => {
@@ -124,8 +125,15 @@ export default function App() {
         }
         if (m.kind === 'order' && m.order) {
           const od = m.order
-          setOrders((o) => [od, ...o].slice(0, 100))
+          // stamp THIS update with its own arrival age (browser clock). The old
+          // code kept one shared total per nOrdNo, so every row for an order
+          // ended up showing the latest (COMPLETE) time — early rows like PUT
+          // ORDER REQ RECEIVED looked as slow as the fill. Per-row stamps fix that.
           const hit = clickRef.current[String(od.nOrdNo)]
+          const stamped = hit
+            ? { ...od, _ageMs: Date.now() - hit.clickMs, _brkMs: hit.brokerMs ?? null }
+            : od
+          setOrders((o) => [stamped, ...o].slice(0, 100))
           if (hit) {
             const totalMs = Date.now() - hit.clickMs
             setLat((prev) => {
@@ -347,8 +355,15 @@ export default function App() {
   const place = async (otype, side = 'B') => {
     const tag = side === 'S' ? 'Sell' : 'Buy'
     const tClick = Date.now()
+    const off = num(f.offset)
+    if (f.entry_mode === 'L-1' && (!Number.isFinite(off) || off < 0)) {
+      say('err', 'Set a valid Offset (>= 0) for L-1 entry.'); return
+    }
     try {
       if (otype === 'BOTH') {
+        if (f.entry_mode === 'L') {
+          say('err', 'Straddle does not support L mode — add the legs to the strike list and fire them with their Limit prices.'); return
+        }
         const ceSym = symOf(f.instrument, f.expiry, f.ce_strike, 'CE')
         const peSym = symOf(f.instrument, f.expiry, f.pe_strike, 'PE')
         const ce = legLtp(ceSym) ?? ltp.ce ?? await quoteLeg('CE')
@@ -363,9 +378,20 @@ export default function App() {
       } else {
         const strike = otype === 'CE' ? f.ce_strike : f.pe_strike
         const sym = symOf(f.instrument, f.expiry, strike, otype)
-        const price = legLtp(sym) ?? ltp[otype.toLowerCase()] ?? await quoteLeg(otype)
+        let limit = null
+        if (f.entry_mode === 'L') {
+          limit = parseFloat(otype === 'CE' ? f.ce_limit : f.pe_limit)
+          if (!Number.isFinite(limit) || limit <= 0) {
+            say('err', `Set a Limit price for ${sym} — entry L needs one (type it next to the quote).`); return
+          }
+        }
+        const live = legLtp(sym)
+        const price = live ?? (f.entry_mode === 'L' ? limit : await quoteLeg(otype))
         if (price == null) { say('err', `Need a ${otype} quote first (press ↻).`); return }
-        const body = { ...f, option_type: otype, strike: String(strike), entry_offset: 0, side }
+        const body = {
+          ...f, option_type: otype, strike: String(strike), entry_offset: 0,
+          offset: off, limit_price: limit, side,
+        }
         const r = await api.post(`/orders/single?ref_ltp=${price}`, body, auth)
         const apiMs = Date.now() - tClick
         rememberClick(r.data.entry_order_id, tClick, r.data.timing, r.data.symbol)
@@ -382,12 +408,27 @@ export default function App() {
     const key = `${leg.otype}-${leg.strike}-${side}`
     setBusyKey(key)
     const tClick = Date.now()
+    const mode = leg.entry_mode || 'MKT'
+    const off = num(leg.offset)
+    if (mode === 'L-1' && (!Number.isFinite(off) || off < 0)) {
+      say('err', `Set a valid Offset (>= 0) for ${leg.otype} ${leg.strike} (L-1 needs one).`); setBusyKey(''); return
+    }
+    let limit = null
+    if (mode === 'L') {
+      limit = parseFloat(leg.limit_price)
+      if (!Number.isFinite(limit) || limit <= 0) {
+        say('err', `Set a Limit price for ${leg.otype} ${leg.strike} — entry L needs one (type it in the Limit column).`); setBusyKey(''); return
+      }
+    }
     try {
       const sym = symOf(f.instrument, f.expiry, leg.strike, leg.otype)
-      const price = legLtp(sym) ?? await quoteFor(leg.otype, leg.strike)
+      const live = legLtp(sym)
+      const price = live ?? (mode === 'L' ? limit : await quoteFor(leg.otype, leg.strike))
       if (price == null) { say('err', `Need a ${leg.otype} ${leg.strike} quote first.`); return }
       const body = {
-        ...f, option_type: leg.otype, strike: String(leg.strike),
+        ...f, entry_mode: mode, target_points: leg.target_points,
+        stop_points: leg.stop_points, offset: off, limit_price: limit,
+        option_type: leg.otype, strike: String(leg.strike),
         entry_offset: 0, side,
       }
       const r = await api.post(`/orders/single?ref_ltp=${price}`, body, auth)
@@ -407,8 +448,18 @@ export default function App() {
     const strike = otype === 'CE' ? f.ce_strike : f.pe_strike
     if (!strike) return
     const key = `${otype}-${strike}`
-    setLegs((v) => (v.some((l) => l.key === key) ? v : [...v, { key, otype, strike: String(strike) }]))
+    // Entry/Tgt/Stop/Offset inherit the globals at add time, then live per row.
+    const leg = {
+      key, otype, strike: String(strike),
+      entry_mode: f.entry_mode, target_points: f.target_points,
+      stop_points: f.stop_points, offset: f.offset,
+      limit_price: otype === 'CE' ? f.ce_limit : f.pe_limit,
+    }
+    setLegs((v) => (v.some((l) => l.key === key) ? v : [...v, leg]))
   }
+
+  const updateLeg = (key, patch) =>
+    setLegs((v) => v.map((l) => (l.key === key ? { ...l, ...patch } : l)))
 
   const exitPosition = async (symbol) => {
     if (!window.confirm(`Flatten ${symbol} at market and cancel its SL/target?`)) return
@@ -539,6 +590,10 @@ export default function App() {
               onChange={(e) => setF({ ...f, entry_mode: e.target.value })}>
               <option>MKT</option><option>ML</option><option>L-1</option><option>L</option>
             </select></div>
+          <div className="field"><label>Offset (L-1)</label>
+            <input type="number" min="0" step="0.5" value={f.offset} disabled={!kotakIn}
+              title="Price improvement for L-1: BUY fills at LTP−offset, SELL at LTP+offset"
+              onChange={(e) => setF({ ...f, offset: e.target.value })} /></div>
           <div className="field"><label>Target (pts)</label>
             <input type="number" value={f.target_points} disabled={!kotakIn}
               onChange={(e) => setF({ ...f, target_points: e.target.value })} /></div>
@@ -571,6 +626,9 @@ export default function App() {
           <button className="btn ghost sm" disabled={!kotakIn || !f.ce_strike || quoting}
             onClick={() => quoteLeg('CE')}>↻ quote</button>
           <span className="ltp">{(f.ce_strike && legLtp(symOf(f.instrument, f.expiry, f.ce_strike, 'CE'))) ?? ltp.ce ?? '—'}</span>
+          <div className="field" style={{ minWidth: 96 }}><label>CE limit ₹</label>
+            <input type="number" min="0" step="0.05" placeholder="L mode" value={f.ce_limit} disabled={!kotakIn}
+              onChange={(e) => setF({ ...f, ce_limit: e.target.value })} /></div>
           <button className="btn ghost sm" disabled={!kotakIn || !f.ce_strike} onClick={() => addLeg('CE')}>+ list</button>
           <div className="field" style={{ minWidth: 150 }}><label>PE strike (ATM ±10)</label>
             <select value={f.pe_strike} disabled={!kotakIn || !visPe.length}
@@ -581,6 +639,9 @@ export default function App() {
           <button className="btn ghost sm" disabled={!kotakIn || !f.pe_strike || quoting}
             onClick={() => quoteLeg('PE')}>↻ quote</button>
           <span className="ltp">{(f.pe_strike && legLtp(symOf(f.instrument, f.expiry, f.pe_strike, 'PE'))) ?? ltp.pe ?? '—'}</span>
+          <div className="field" style={{ minWidth: 96 }}><label>PE limit ₹</label>
+            <input type="number" min="0" step="0.05" placeholder="L mode" value={f.pe_limit} disabled={!kotakIn}
+              onChange={(e) => setF({ ...f, pe_limit: e.target.value })} /></div>
           <button className="btn ghost sm" disabled={!kotakIn || !f.pe_strike} onClick={() => addLeg('PE')}>+ list</button>
         </div>
 
@@ -598,18 +659,30 @@ export default function App() {
 
       <div className="card">
         <h2>Strike list — instant execution ({legs.length})</h2>
-        <p className="sub">Add strikes above, then Buy/Sell each row directly. Live websocket LTP per leg; list survives orders and refreshes, clears only on instrument/expiry change.</p>
+        <p className="sub">Entry/Tgt/Stop/Offset inherit the ticket at add time, then edit per row. L needs its Limit ₹ cell filled; L-1 uses the Offset cell (BUY = LTP−off, SELL = LTP+off). List survives orders and refreshes, clears only on instrument/expiry change.</p>
         {legs.length === 0 ? <div className="empty">Empty — pick a CE/PE strike above and press “+ list”.</div> : (
           <table className="tbl"><thead><tr>
-            <th>Contract</th><th>Type</th><th>Strike</th><th>Live LTP</th><th>Buy</th><th>Sell</th><th></th>
+            <th>Contract</th><th>Live LTP</th><th>Entry</th><th>Tgt</th><th>Stop</th><th>Off</th><th>Limit ₹</th><th>Buy</th><th>Sell</th><th></th>
           </tr></thead><tbody>
             {legs.map((l) => {
               const sym = symOf(f.instrument, f.expiry, l.strike, l.otype)
               const live = legLtp(sym)
               return (
                 <tr key={l.key}>
-                  <td>{sym}</td><td>{l.otype}</td><td>{l.strike}</td>
+                  <td>{sym}</td>
                   <td className="ltp">{live ?? '…'}</td>
+                  <td><select className="mini" value={l.entry_mode || 'MKT'}
+                    onChange={(e) => updateLeg(l.key, { entry_mode: e.target.value })}>
+                    <option>MKT</option><option>ML</option><option>L-1</option><option>L</option>
+                  </select></td>
+                  <td><input className="mini" type="number" min="0" value={l.target_points}
+                    onChange={(e) => updateLeg(l.key, { target_points: e.target.value })} /></td>
+                  <td><input className="mini" type="number" min="0" value={l.stop_points}
+                    onChange={(e) => updateLeg(l.key, { stop_points: e.target.value })} /></td>
+                  <td><input className="mini" type="number" min="0" step="0.5" value={l.offset}
+                    title="L-1 offset" onChange={(e) => updateLeg(l.key, { offset: e.target.value })} /></td>
+                  <td><input className="mini wide" type="number" min="0" step="0.05" placeholder="L req."
+                    value={l.limit_price || ''} onChange={(e) => updateLeg(l.key, { limit_price: e.target.value })} /></td>
                   <td><button className="btn buy sm" disabled={needTicket || busyKey === `${l.key}-B`}
                     onClick={() => placeRow(l, 'B')}>{busyKey === `${l.key}-B` ? '…' : 'Buy'}</button></td>
                   <td><button className="btn sell sm" disabled={needTicket || busyKey === `${l.key}-S`}
@@ -637,7 +710,7 @@ export default function App() {
                 <td>{o.quantity}</td>
                 <td>{o.target_price}</td><td>{o.stop_loss_price}</td>
                 <td>{o.strategy}</td>
-                <td><span className={`st ${o.status}`}>{o.status}</span></td>
+                <td><span className={`st ${o.status}`} title={o.error || ''}>{o.status}</span></td>
                 <td className="ltp">{fmtLat(o.fill_latency_ms) ?? '—'}</td>
               </tr>
             ))}
@@ -666,8 +739,9 @@ export default function App() {
           {orders.length === 0 && <div className="empty">No order updates yet this session.</div>}
           {orders.slice(0, 30).map((o, i) => {
             const l = lat[String(o.nOrdNo)]
-            const total = l ? fmtLat(l.totalMs) : null
-            const brk = l?.brokerMs != null ? fmtLat(l.brokerMs) : null
+            // prefer this row's own arrival stamp; fall back to the shared map
+            const total = fmtLat(o._ageMs ?? l?.totalMs)
+            const brk = o._brkMs != null ? fmtLat(o._brkMs) : (l?.brokerMs != null ? fmtLat(l.brokerMs) : null)
             return (
               <div key={`${o.nOrdNo}-${i}`} className={`ord ${feedClass(o.ordSt)}`}>
                 <span className="sym">{o.trdSym}</span>

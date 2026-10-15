@@ -21,8 +21,15 @@ class SingleOrderBody(BaseModel):
     option_type: Literal["CE", "PE"]
     strike: str
     lots: int = 1
-    entry_mode: Literal["MKT", "ML", "L", "L-1"] = "MKT"
-    entry_offset: float = 0          # used when entry_mode == L
+    entry_mode: Literal["MKT", "ML", "L-1", "L"] = "MKT"
+    entry_offset: float = 0          # legacy: used when entry_mode == L and limit_price is None
+    # offset: price improvement for L-1, symmetric by side —
+    #   BUY  L-1 -> ref - offset (bid below, passive)
+    #   SELL L-1 -> ref + offset (offer above, passive)
+    offset: float = 1.0
+    # limit_price: explicit limit for entry_mode == L (UI Limit column).
+    # Required for L; must be > 0.
+    limit_price: float | None = None
     target_points: float = 20
     stop_points: float = 10
     strategy: Literal["market_exit", "trailing_stop"] = "market_exit"
