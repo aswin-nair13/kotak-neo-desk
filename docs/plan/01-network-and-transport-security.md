@@ -1,6 +1,6 @@
 # Plan 01 — Network & Transport Security (C1, C2, C3, C4)
 
-Status: **NOT IMPLEMENTED** · Priority: P0 · Scope: `backend/app/main.py`,
+Status: **IMPLEMENTED** (C2 = Tailscale option A) · Priority: P0 · Scope: `backend/app/main.py`,
 `backend/app/auth.py`, `backend/app/routes/auth.py`, `backend/app/sfeed_bridge.py`
 (only where it feeds the socket), `frontend/src/api.js`, `frontend/src/App.jsx`,
 `Caddyfile`, `docker-compose.yml`, `deploy/*`.

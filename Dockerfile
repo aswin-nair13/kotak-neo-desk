@@ -16,4 +16,6 @@ COPY backend/ ./backend/
 COPY --from=fe /fe/dist ./frontend/dist
 ENV PYTHONPATH=/srv/backend PATH="/srv/backend/.venv/bin:$PATH"
 EXPOSE 8000
-CMD ["uv", "run", "--project", "backend", "uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
+# Port 8000 is only reachable from Caddy on the internal compose network, so the
+# proxy's X-Forwarded-For is trusted for the client IP used by the allowlist.
+CMD ["uv", "run", "--project", "backend", "uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--proxy-headers", "--forwarded-allow-ips=*"]

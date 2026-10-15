@@ -1,12 +1,21 @@
-# Fresh EC2 with no domain: Caddy serves HTTPS on first boot via self-signed fallback?
-# Easiest path until you have a domain: access via http://<EC2-IP> behind IP whitelist + app login,
-# then switch the site line below to your domain for auto Let's Encrypt.
-# Replace :80 with your.domain.com once DNS points at the EC2 elastic IP.
-
+# Tailscale (option A, recommended): no public 80/443.
+#
+# `tailscale serve` terminates TLS on the host with a trusted *.ts.net cert and
+# proxies to Caddy over loopback. Caddy itself serves plain HTTP and is published
+# to 127.0.0.1 only (see docker-compose.yml), so it is never reachable publicly.
+#
+#   1. Install Tailscale on the EC2 box and your PC, join both to the tailnet.
+#   2. tailscale serve --bg --https=443 http://127.0.0.1:80
+#   3. Browse https://<machine>.<tailnet>.ts.net
+#
+# Keep the app login + JWT: Tailscale is the network layer, not a substitute for auth.
 :80 {
 	reverse_proxy app:8000
 }
-# Example with domain (uncomment, comment the :80 block):
-# your.domain.com {
-# 	reverse_proxy app:8000
-# }
+
+# --- Option B: public hostname + Let's Encrypt (no domain needed) ---
+# Requires inbound 80 (ACME HTTP-01) + 443 in the security group and UFW, and
+# publishing 80/443 in docker-compose.yml. Replace with your EC2 public IP:
+#   13-233-1-2.sslip.io {
+#   	reverse_proxy app:8000
+#   }

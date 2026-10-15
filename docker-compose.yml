@@ -7,7 +7,13 @@ services:
   caddy:
     image: caddy:2-alpine
     restart: unless-stopped
-    ports: ["80:80", "443:443"]
+    # Tailscale (option A): publish to loopback only — `tailscale serve` fronts TLS
+    # on the tailnet and proxies here. No public 80/443.
+    ports:
+      - "127.0.0.1:80:80"
+      # Option B (sslip.io + Let's Encrypt): replace the line above with:
+      # - "80:80"
+      # - "443:443"
     volumes:
       - ./Caddyfile:/etc/caddy/Caddyfile:ro
       - caddy_data:/data

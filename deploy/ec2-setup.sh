@@ -1,24 +1,34 @@
 #!/bin/bash
 # EC2 setup (Ubuntu 24.04, ap-south-1 Mumbai recommended for NSE latency).
-# Your home IP is dynamic, so three supported patterns (pick ONE):
-#   1. CIDR (simplest): ./ec2-setup.sh 49.37.0.0/16   — allows your ISP pool; check UFW supports CIDR natively.
-#   2. DDNS (tighter): run a no-ip/duckdns updater at home, then open UFW per current IP and
-#      re-run ./deploy/ufw-refresh.sh (cron) which re-resolves the name. App layer also
-#      re-resolves IP_ALLOWLIST hostnames by itself.
-#   3. Tailscale (tightest, recommended if you can install it on PC+EC2): no public 80/443 at all.
-#      See deploy/tailscale.md.
+#
+# Network model (chosen: Tailscale, option A — see docs/plan/01-network-and-transport-security.md):
+#   * No public 80/443. Caddy is published to loopback only (docker-compose.yml).
+#   * `tailscale serve` terminates TLS with a trusted *.ts.net cert and proxies to
+#     Caddy on 127.0.0.1:80. Only tailnet devices can reach the desk.
+#   * SSH: keep your home-IP/CIDR opening below for bootstrap, then prefer SSH over
+#     the tailnet. Your home IP is dynamic, so a CIDR (49.37.0.0/16) or DDNS is fine.
+#
+# Usage: ./ec2-setup.sh <YOUR_IP_OR_CIDR>   (e.g. 49.37.0.0/16)
 set -euo pipefail
 ALLOW="${1:?Usage: ./ec2-setup.sh <YOUR_IP_OR_CIDR>  (e.g. 49.37.0.0/16)}"
 
-sudo apt-get update && sudo apt-get install -y docker.io docker-compose-plugin ufw fail2ban dnsutils
+sudo apt-get update
+sudo apt-get install -y docker.io docker-compose-plugin ufw fail2ban dnsutils curl
 sudo usermod -aG docker ubuntu
 
+# Public surface: SSH only (from your IP). 80/443 stay closed — TLS is via Tailscale.
 sudo ufw default deny incoming
 sudo ufw default allow outgoing
 sudo ufw allow from "$ALLOW" to any port 22
-sudo ufw allow from "$ALLOW" to any port 80
-sudo ufw allow from "$ALLOW" to any port 443
 sudo ufw --force enable
 
-echo "UFW done for $ALLOW. Deploy with: docker compose up -d --build"
-echo "Set the same range/name in .env IP_ALLOWLIST (defence in depth)."
+# Tailscale: install and join the tailnet (interactive `tailscale up` prints a URL).
+curl -fsSL https://tailscale.com/install.sh | sh
+
+echo "UFW done (SSH only from $ALLOW; 80/443 closed)."
+echo "Next:"
+echo "  1. sudo tailscale up"
+echo "  2. Deploy: docker compose up -d --build"
+echo "  3. sudo tailscale serve --bg --https=443 http://127.0.0.1:80"
+echo "  4. Browse https://<machine>.<tailnet>.ts.net"
+echo "Set IP_ALLOWLIST to your tailnet range (100.64.0.0/10) or a tighter value in .env."

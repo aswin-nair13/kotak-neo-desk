@@ -1,13 +1,27 @@
-# Option 3: Tailscale (best for dynamic home IPs — no public ports)
+# Option A: Tailscale (recommended — encrypted transport, no public ports)
 
-1. Install Tailscale on EC2 and your PC, join both to the same tailnet.
-2. `sudo tailscale serve` the app, or bind Caddy to the tailnet IP only:
+Tailscale terminates TLS with a **trusted** `*.ts.net` certificate, so there is
+no self-signed warning and no Certbot/Let's Encrypt setup. Nothing is exposed
+beyond your tailnet.
+
+## Setup
+
+1. Install Tailscale on the EC2 box and your PC; join both to the same tailnet.
+   `./deploy/ec2-setup.sh <your-ip>` installs it; then run `sudo tailscale up`.
+2. Deploy the stack. Caddy is published to loopback only (`127.0.0.1:80`), so it
+   is reachable by `tailscale serve` but not from the internet:
+   ```bash
+   docker compose up -d --build
    ```
-   # Caddyfile
-   http://100.x.y.z:8080 {   # your EC2 tailnet IP
-       reverse_proxy app:8000
-   }
+3. Front TLS on the tailnet and proxy to Caddy:
+   ```bash
+   sudo tailscale serve --bg --https=443 http://127.0.0.1:80
+   sudo tailscale serve status   # shows the https://<machine>.<tailnet>.ts.net URL
    ```
-3. Close 80/443 publicly: `sudo ufw delete allow 80/tcp` etc. SSH via Tailscale too.
-4. Keep the app login + JWT — Tailscale is the network layer, not a substitute for auth.
-5. `IP_ALLOWLIST` can stay as your tailnet CIDR (`100.64.0.0/10`) or be left strict.
+4. Browse `https://<machine>.<tailnet>.ts.net` from any tailnet device.
+5. Keep 80/443 closed publicly (already done by `ec2-setup.sh`); SSH via the
+   tailnet too once bootstrapped.
+6. Keep the app login + JWT — Tailscale is the network layer, not a substitute
+   for auth.
+7. `IP_ALLOWLIST` can be your tailnet CIDR (`100.64.0.0/10`) or left tighter.
+   With `tailscale serve` proxying locally, the app sees the client's tailnet IP.

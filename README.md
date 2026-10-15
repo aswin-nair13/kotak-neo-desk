@@ -16,11 +16,18 @@ Phase 2 hook: `backend/app/synthetic_engine.py::on_tick` is where algo triggers 
 > TransTrader uses. `backend/tests/test_sdk_compat.py` pins our calls to the v3 signatures.
 
 ## Security (unauthorized-access hardening)
-1. **AWS SG + UFW**: only YOUR home IP → 22/80/443 (`deploy/ec2-setup.sh`).
-2. **Caddy TLS**: HTTPS; HTTP→HTTPS redirect once a domain is attached.
-3. **IP allowlist middleware**: `IP_ALLOWLIST` rejects non-listed IPs at `/api`.
+1. **Tailscale TLS (recommended)**: no public 80/443. `tailscale serve` terminates
+   TLS with a trusted `*.ts.net` cert and proxies to loopback Caddy (`deploy/tailscale.md`).
+   UFW opens only 22 (`deploy/ec2-setup.sh`). A public `sslip.io` hostname remains a fallback.
+2. **Caddy** fronts the app; published to `127.0.0.1:80` only under Tailscale.
+3. **IP allowlist middleware**: `IP_ALLOWLIST` rejects non-listed IPs on **all** paths
+   (`/api` **and** `/ws`) with `403`/WebSocket `1008`. `X-Forwarded-For` is honored only
+   when `TRUST_PROXY=true` behind a trusted proxy.
 4. **App login**: bcrypt password → short-lived JWT (`APP_USERNAME` / `APP_PASSWORD_BCRYPT`).
-5. **Kotak creds server-side only**: consumer key / UCC / MPIN in EC2 `.env`, never in git or the browser.
+5. **Authenticated live feed**: the `/ws` socket requires the JWT as its **first frame**
+   and an allowed `Origin`; nothing is streamed before auth (closes `1008`).
+6. **No wildcard CORS**: same-origin only; cross-origin requires explicit `ALLOWED_ORIGINS`.
+7. **Kotak creds server-side only**: consumer key / UCC / MPIN in EC2 `.env`, never in git or the browser.
    Morning login = app login → click *Kotak TOTP login* → type live TOTP (same as TransTrader OTP step).
 
 ## Quickstart (local, uv)
@@ -33,15 +40,17 @@ uv run --group dev pytest tests/ -q   # SDK compat checks
 cd frontend; npm install; npm run dev   # http://localhost:5173
 ```
 
-## Deploy (fresh EC2, no domain yet)
+## Deploy (fresh EC2, Tailscale TLS — no domain needed)
 ```bash
 # on EC2 (Ubuntu, ap-south-1):
 git clone <this-repo> && cd kotak-trader
-cp .env.example .env && nano .env   # fill all secrets + IP_ALLOWLIST=<your-pc-ip>
-./deploy/ec2-setup.sh <your-pc-ip>
+cp .env.example .env && nano .env   # secrets + IP_ALLOWLIST=100.64.0.0/10 + ALLOWED_ORIGINS=https://<machine>.<tailnet>.ts.net
+./deploy/ec2-setup.sh <your-ip>     # installs Docker + Tailscale, opens only SSH
+sudo tailscale up                  # join the tailnet (install on your PC too)
 docker compose up -d --build
-# browse http://<EC2-IP> (allowlisted IP + app login required)
-# later: point DNS at Elastic IP, switch Caddyfile to domain block, docker compose up -d
+sudo tailscale serve --bg --https=443 http://127.0.0.1:80
+# browse https://<machine>.<tailnet>.ts.net (tailnet + app login required)
+# fallback without Tailscale: use a public <IP>.sslip.io hostname in the Caddyfile
 ```
 
 ## Repo layout

@@ -112,6 +112,16 @@ export default function App() {
   useEffect(() => {
     if (!token) return
     const ws = new WebSocket(wsUrl())
+    // First frame authenticates the feed; the server sends nothing before it.
+    ws.onopen = () => ws.send(JSON.stringify({ token }))
+    ws.onclose = (e) => {
+      // 1008 = auth/origin policy rejection -> drop the stale token, re-login.
+      if (e.code === 1008) {
+        localStorage.removeItem('token')
+        setToken('')
+        setKotakIn(false)
+      }
+    }
     ws.onmessage = (e) => {
       try {
         const m = JSON.parse(e.data)

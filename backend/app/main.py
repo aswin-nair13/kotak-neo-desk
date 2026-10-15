@@ -5,6 +5,7 @@ Serves: /api/* + /ws live feed + frontend/dist static (prod).
 """
 
 import asyncio
+import json
 import logging
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -13,8 +14,8 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
-from .auth import IPAllowlistMiddleware
-from .config import settings
+from .auth import IPAllowlistMiddleware, decode_user_token, origin_allowed
+from .config import ALLOWED_ORIGINS, settings
 from .kotak_client import KotakService
 from .routes import auth as auth_routes
 from .routes import market as market_routes
@@ -50,8 +51,13 @@ bridge = SFeedBridge(hub=hub, engine=engine, kotak=kotak)
 
 app = FastAPI(title="KotakAPI Trader", lifespan=lifespan)
 app.add_middleware(IPAllowlistMiddleware)
-app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True,
-                   allow_methods=["*"], allow_headers=["*"])
+# The SPA is served same-origin (prod) and the Vite dev server proxies /api and
+# /ws, so no CORS is needed by default. Only enable an explicit, credentialed-off
+# policy when ALLOWED_ORIGINS is configured for a cross-origin client.
+if ALLOWED_ORIGINS:
+    app.add_middleware(CORSMiddleware, allow_origins=sorted(ALLOWED_ORIGINS),
+                       allow_credentials=False, allow_methods=["GET", "POST"],
+                       allow_headers=["Authorization", "Content-Type"])
 
 # wire singletons into route modules
 auth_routes.kotak = kotak
@@ -74,14 +80,56 @@ def health():
             "synthetic_open": len([o for o in engine.all() if o["status"] not in ("CLOSED",)])}
 
 
+WS_AUTH_TIMEOUT_SEC = 3.0
+
+
+def _ws_token(frame: str) -> str | None:
+    try:
+        msg = json.loads(frame)
+    except (json.JSONDecodeError, TypeError):
+        return None
+    if not isinstance(msg, dict):
+        return None
+    token = msg.get("token")
+    return token if isinstance(token, str) and token else None
+
+
 @app.websocket("/ws")
 async def ws_feed(ws: WebSocket):
+    # Origin allowlist is checked before accept; mismatches get a policy close.
+    if not origin_allowed(ws.headers.get("origin")):
+        await ws.close(code=1008)
+        return
+
     await ws.accept()
+
+    # First-frame auth: nothing is sent or registered until a valid JWT arrives.
+    # Keep reading (tolerating stray/keepalive frames) until the short deadline.
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + WS_AUTH_TIMEOUT_SEC
+    authed = False
+    while not authed:
+        remaining = deadline - loop.time()
+        if remaining <= 0:
+            break
+        try:
+            frame = await asyncio.wait_for(ws.receive_text(), timeout=remaining)
+        except (asyncio.TimeoutError, WebSocketDisconnect):
+            break
+        if decode_user_token(_ws_token(frame)) is not None:
+            authed = True
+
+    if not authed:
+        await ws.close(code=1008)
+        return
+
     await hub.register(ws)
     try:
         while True:
             await ws.receive_text()  # keepalive; server pushes ticks/orders
     except WebSocketDisconnect:
+        pass
+    finally:
         await hub.unregister(ws)
 
 

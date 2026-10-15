@@ -21,6 +21,13 @@ class Settings(BaseSettings):
     #   hostname       myhome.ddns.net (DDNS — re-resolved every N sec)
     ip_allowlist: str = ""
     ip_allowlist_refresh_sec: int = 300
+    # Only honor X-Forwarded-For for the client IP when the app sits behind a
+    # trusted proxy (Caddy). Keep false unless uvicorn is run with
+    # --proxy-headers --forwarded-allow-ips=<proxy> (see Dockerfile/compose).
+    trust_proxy: bool = False
+    # Comma-separated allowed browser Origins for the /ws upgrade and CORS.
+    # Empty = no Origin enforcement (dev Vite proxy) and no CORS middleware.
+    allowed_origins: str = ""
     # Optional: restrict EC2 security-group/UFW updates to a DDNS name (see deploy/).
 
     kotak_consumer_key: str = ""
@@ -37,3 +44,5 @@ class Settings(BaseSettings):
 settings = Settings()
 
 ALLOWLIST = {ip.strip() for ip in settings.ip_allowlist.split(",") if ip.strip()}
+
+ALLOWED_ORIGINS = {o.strip() for o in settings.allowed_origins.split(",") if o.strip()}
