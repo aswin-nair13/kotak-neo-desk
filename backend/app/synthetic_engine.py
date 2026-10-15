@@ -72,6 +72,25 @@ class SyntheticEngine:
                 continue
         return None
 
+    @staticmethod
+    def _fill_qty(od: dict) -> float | None:
+        """Filled quantity from a feed/book frame, or None when absent/zero.
+
+        Used to place the SL for the ACTUAL fill size (Plan 04 H3): a partial
+        fill must never get a full-size protective SL.
+        """
+        for k in ("fldQty", "filled_quantity", "filledQty", "flQty"):
+            v = od.get(k)
+            if v in (None, ""):
+                continue
+            try:
+                f = float(v)
+            except (TypeError, ValueError):
+                continue
+            if f > 0:
+                return f
+        return None
+
     def on_order_update(self, od: dict):
         oid = od.get("nOrdNo")
         status = str(od.get("ordSt", "")).lower()
@@ -81,7 +100,10 @@ class SyntheticEngine:
         t_now = int(time.time() * 1000)
         log.info("synthetic %s: %s -> %s (%s)", syn["trading_symbol"], oid, status, syn["status"])
 
-        if oid == syn["entry_order_id"] and status == "complete" and syn["status"] == "PENDING_ENTRY":
+        if oid == syn["entry_order_id"] and status == "complete" \
+                and syn["status"] in ("PENDING_ENTRY", "ACTIVE", "TRAILING"):
+            # ACTIVE/TRAILING included so a later fill (partial entry whose
+            # remainder was left working) can resize the existing SL.
             self._place_sl(syn, od)
 
         elif oid == syn["entry_order_id"] and syn["status"] == "PENDING_ENTRY" and "reject" in status:
@@ -143,21 +165,83 @@ class SyntheticEngine:
     def _place_sl(self, syn: dict, od: dict):
         """Place the protective SL for a filled entry, exactly once.
 
-        Idempotent (Plan 04 H3 guard): once `sl_placed`/`sl_order_id` is set a
-        re-driven event (duplicate feed frame or Plan 03 reconcile) is a no-op,
-        so a fill that arrived during a feed gap can never double-place an SL.
+        Strict fill gate (Plan 04 H3): the SL is placed ONLY when the entry is
+        genuinely filled — a positive average fill price must be available, from
+        the feed frame or, if absent, fetched once via the broker's order
+        history; it is never guessed from the planned entry. The SL is sized to
+        the ACTUAL filled quantity. On a partial fill the SL covers the filled
+        qty and the unfilled remainder is left working (documented choice); if
+        that remainder later fills, the SL is resized to cover it.
+
+        Idempotent: once `sl_placed`/`sl_order_id` is set a re-driven event
+        (duplicate feed frame or Plan 03 reconcile) only ever resizes, never
+        double-places, so an entry fill that arrived during a feed gap can never
+        leave two live SLs.
 
         Recomputes target/SL from the ACTUAL fill price, not the planned entry
         (ref_ltp+5). A planned stop can end up on the wrong side of the market
         (e.g. fill lower than planned -> SELL SL trigger above LTP), which the
         exchange rejects as 'STOP PRICE IS NOT REASONABLE'.
         """
+        side = syn.get("side", "B")
+        sl_txn = "B" if side == "S" else "S"
+        try:
+            ordered = float(syn.get("quantity") or 0)
+        except (TypeError, ValueError):
+            ordered = 0.0
+        filled = self._fill_qty(od)
+
         if syn.get("sl_placed") or syn.get("sl_order_id"):
+            # Already protected. Only react if the fill grew (a partial entry's
+            # remainder filled) — resize the SL so the added qty isn't left naked.
+            try:
+                covered = float(syn.get("sl_quantity") or 0)
+            except (TypeError, ValueError):
+                covered = 0.0
+            if syn.get("sl_order_id") and filled is not None and filled > covered:
+                try:
+                    self.broker.modify_sl(syn["sl_order_id"], str(int(filled)),
+                                          syn["stop_loss_price"], transaction_type=sl_txn)
+                    syn["quantity"] = str(int(filled))
+                    syn["sl_quantity"] = filled
+                    log.info("SL %s resized to %s for %s (remainder filled)",
+                             syn["sl_order_id"], int(filled), syn["trading_symbol"])
+                except Exception as e:
+                    log.error("SL resize failed for %s: %s", syn["sl_order_id"], e)
             return
+
+        # -- strict fill gate: a real price or nothing --
+        fill = self._fill_price(od)
+        if fill is None:
+            try:
+                fill = self.broker.average_fill_price(str(syn.get("entry_order_id")))
+            except Exception as e:
+                log.error("order history fill price for %s failed: %s",
+                          syn.get("entry_order_id"), e)
+                fill = None
+        try:
+            fill = float(fill) if fill is not None else None
+        except (TypeError, ValueError):
+            fill = None
+        if not fill or fill <= 0:
+            syn["status"] = "ERRORED"
+            syn["error"] = "entry complete but no fill price (feed + order history) — SL not placed"
+            log.error("entry %s (%s) complete with no fill price — NO SL placed",
+                      syn["trading_symbol"], syn.get("entry_order_id"))
+            return
+
+        if filled is None or filled <= 0:
+            # 'complete' means the order is fully executed, so a missing fldQty
+            # on the terminal frame is trusted as a full fill.
+            filled = ordered
+        if ordered and 0 < filled < ordered:
+            log.warning("partial fill for %s (%s): %s of %s filled — SL sized to "
+                        "the fill, remainder left working", syn["trading_symbol"],
+                        syn.get("entry_order_id"), int(filled), int(ordered))
+
         syn["sl_placed"] = True
         t_now = int(time.time() * 1000)
         try:
-            side = syn.get("side", "B")
             # stored distances (preferred) — fall back to deriving from plan
             try:
                 target_dist = float(syn.get("target_points", 0) or 0)
@@ -167,8 +251,7 @@ class SyntheticEngine:
                 stop_dist = float(syn.get("stop_points", 0) or 0)
             except (TypeError, ValueError):
                 stop_dist = 0.0
-            fill = self._fill_price(od)
-            if fill and target_dist and stop_dist:
+            if target_dist and stop_dist:
                 if side == "S":  # short: profit when price falls
                     target = max(0.05, fill - target_dist)
                     stop = fill + stop_dist
@@ -177,9 +260,9 @@ class SyntheticEngine:
                     stop = max(0.05, fill - stop_dist)
                 syn["target_price"] = f"{target:.2f}"
                 syn["stop_loss_price"] = f"{stop:.2f}"
-                syn["fill_price"] = f"{fill:.2f}"
-            sl_txn = "B" if side == "S" else "S"
-            r = self.broker.place_stop_loss(syn["exchange_segment"], syn["quantity"],
+            syn["fill_price"] = f"{fill:.2f}"
+            sl_qty = str(int(filled)) if filled and filled > 0 else syn["quantity"]
+            r = self.broker.place_stop_loss(syn["exchange_segment"], sl_qty,
                                             syn["trading_symbol"], syn["stop_loss_price"],
                                             transaction_type=sl_txn,
                                             product=syn.get("product", "MIS"))
@@ -191,12 +274,14 @@ class SyntheticEngine:
                 except (TypeError, ValueError):
                     fill_lat = None
                 syn.update(status="ACTIVE", sl_order_id=r.get("nOrdNo"),
+                           quantity=sl_qty, sl_quantity=filled,
                            fill_at_ms=t_now, sl_placed_at_ms=t_sl)
                 if fill_lat is not None and fill_lat >= 0:
                     syn["fill_latency_ms"] = fill_lat
             else:
                 syn["status"] = "ERRORED"
                 syn["error"] = str(r)[:300]
+                log.error("SL placement rejected for %s: %s", syn["trading_symbol"], r)
         except Exception as e:
             log.error("SL place failed: %s", e)
             syn["status"] = "ERRORED"

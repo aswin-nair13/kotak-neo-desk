@@ -1,6 +1,9 @@
 # Plan 04 — Order-Execution Integrity (H3, M5, M6)
 
-Status: **NOT IMPLEMENTED** · Priority: P0 (trading safety) · Scope:
+Status: **IMPLEMENTED** (H3 strict fill gate + M5 idempotency/button lock + M6
+price floor; partial fill = SL sized to the fill with the remainder left
+working, re-enable on terminal feed state or a 30 s timeout) · Priority: P0
+(trading safety) · Scope:
 `backend/app/synthetic_engine.py`, `backend/app/routes/orders.py`,
 `backend/app/kotak_client.py`, `backend/app/schemas.py`,
 `frontend/src/App.jsx`, `frontend/src/api.js`, tests.

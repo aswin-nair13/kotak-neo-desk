@@ -39,6 +39,10 @@ class SingleOrderBody(BaseModel):
     # SDK v3 place_order has no BO/CO kwargs — bracket behaviour is synthetic
     # (entry + auto SL + target/trailing via SyntheticEngine), so MIS/NRML only.
     product: Literal["MIS", "NRML", "CNC"] = "MIS"
+    # client_order_tag: per-click idempotency key (M5). A duplicate request with
+    # the same tag within the server TTL returns the original order instead of
+    # placing a second one. Echoed by the broker as GuiOrdId.
+    client_order_tag: str | None = None
 
 
 class StraddleBody(BaseModel):
@@ -55,6 +59,8 @@ class StraddleBody(BaseModel):
     # side applies to both legs: B = buy straddle, S = sell straddle.
     side: Literal["B", "S"] = "B"
     product: Literal["MIS", "NRML", "CNC"] = "MIS"
+    # client_order_tag: per-click idempotency key (M5); dedupes both legs at once.
+    client_order_tag: str | None = None
 
 
 class WatchLeg(BaseModel):

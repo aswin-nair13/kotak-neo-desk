@@ -1,6 +1,7 @@
 """Order endpoints: single leg, straddle (CE+PE), cancel/modify, synthetic list, orderbook."""
 
 import logging
+import threading
 import time
 
 from fastapi import APIRouter, Depends, HTTPException
@@ -20,6 +21,39 @@ kotak: KotakService | None = None
 engine: SyntheticEngine | None = None
 hub: Hub | None = None
 bridge = None  # SFeedBridge, wired in main.py
+
+# M5 — server-side idempotency. The UI sends a per-click `client_order_tag`;
+# a duplicate (double-click / retry) with the same tag within the TTL returns
+# the original response instead of placing a second order. The lock makes the
+# check-and-place atomic so two concurrent identical requests can't both reach
+# the broker.
+IDEM_TTL_SEC = 60.0
+_idem_lock = threading.Lock()
+_idem_cache: dict[str, tuple[float, dict]] = {}
+
+
+def _idem_replay(tag: str | None):
+    """Cached response for a tag placed within the TTL, else None. Caller holds _idem_lock."""
+    if not tag:
+        return None
+    hit = _idem_cache.get(tag)
+    if hit is None:
+        return None
+    ts, resp = hit
+    if time.time() - ts >= IDEM_TTL_SEC:
+        _idem_cache.pop(tag, None)
+        return None
+    return resp
+
+
+def _idem_store(tag: str | None, resp: dict):
+    """Record a placed order's response under its tag, pruning expired entries. Caller holds _idem_lock."""
+    if not tag:
+        return
+    now = time.time()
+    for k in [k for k, (ts, _) in _idem_cache.items() if now - ts >= IDEM_TTL_SEC]:
+        _idem_cache.pop(k, None)
+    _idem_cache[tag] = (now, resp)
 
 
 def _lot(instrument: str) -> int:
@@ -68,6 +102,9 @@ def _leg(instrument, expiry, option_type, strike, lots, mode, ref_ltp, entry_off
         entry = float(ref_ltp) + 5
     else:  # SELL MKT: accept below last price so the short fills immediately
         entry = float(ref_ltp) - 5
+    # M6: never emit a non-positive price (SELL MKT on a cheap premium computes
+    # ref-5 <= 0; the exchange rejects it). Floor every mode at one tick.
+    entry = round(max(0.05, float(entry)), 2)
     return exchange, symbol, qty, entry
 
 
@@ -76,7 +113,7 @@ def _ms() -> int:
 
 
 def _place_tracked(exchange, symbol, qty, entry, body_target, body_stop, strategy, trail, product,
-                   side: str = "B", t_recv_ms: int | None = None):
+                   side: str = "B", t_recv_ms: int | None = None, tag: str | None = None):
     """Place entry as plain Limit; SL/target/trailing are managed synthetically by the engine.
     (SDK v3 place_order exposes no native BO/CO kwargs.)
     side B = buy/long (SL+exit are SELL), S = sell/short (SL+exit are BUY).
@@ -90,6 +127,8 @@ def _place_tracked(exchange, symbol, qty, entry, body_target, body_stop, strateg
     t_recv_ms = t_recv_ms if t_recv_ms is not None else _ms()
     kw = dict(exchange_segment=exchange, quantity=qty, trading_symbol=symbol,
               transaction_type=side, product=product, order_type="L", price=entry)
+    if tag:
+        kw["tag"] = tag  # echoed by the broker as GuiOrdId; M5 dedupe marker
     t_b0 = _ms()
     r = kotak.place_order(**kw)
     t_b1 = _ms()
@@ -132,8 +171,17 @@ def place_single(body: SingleOrderBody, ref_ltp: float = 0):
     ex, sym, qty, entry = _leg(body.instrument, body.expiry, body.option_type, body.strike,
                                body.lots, body.entry_mode, ltp, body.entry_offset, body.side,
                                body.offset, body.limit_price)
-    return _place_tracked(ex, sym, qty, entry, body.target_points, body.stop_points,
-                          body.strategy, body.trail_distance, body.product, body.side, t_recv)
+    tag = (body.client_order_tag or "").strip() or None
+    with _idem_lock:
+        replay = _idem_replay(tag)
+        if replay is not None:
+            log.info("idempotent replay: single tag=%s -> %s", tag, replay.get("entry_order_id"))
+            return replay
+        result = _place_tracked(ex, sym, qty, entry, body.target_points, body.stop_points,
+                                body.strategy, body.trail_distance, body.product, body.side,
+                                t_recv, tag=tag)
+        _idem_store(tag, result)
+        return result
 
 
 @router.post("/straddle", dependencies=[Depends(require_user)])
@@ -141,12 +189,22 @@ def place_straddle(body: StraddleBody, ce_ltp: float = 0, pe_ltp: float = 0):
     t_recv = _ms()
     if not (ce_ltp and pe_ltp):
         raise HTTPException(status_code=400, detail="Pass ?ce_ltp=&pe_ltp= from tickers")
-    out = []
-    for otype, strike, ltp in (("CE", body.ce_strike, ce_ltp), ("PE", body.pe_strike, pe_ltp)):
-        ex, sym, qty, entry = _leg(body.instrument, body.expiry, otype, strike, body.lots, body.entry_mode, ltp, 0, body.side)
-        out.append(_place_tracked(ex, sym, qty, entry, body.target_points, body.stop_points,
-                                  body.strategy, body.trail_distance, body.product, body.side, t_recv))
-    return {"legs": out}
+    tag = (body.client_order_tag or "").strip() or None
+    with _idem_lock:
+        replay = _idem_replay(tag)
+        if replay is not None:
+            log.info("idempotent replay: straddle tag=%s", tag)
+            return replay
+        out = []
+        for otype, strike, ltp in (("CE", body.ce_strike, ce_ltp), ("PE", body.pe_strike, pe_ltp)):
+            ex, sym, qty, entry = _leg(body.instrument, body.expiry, otype, strike, body.lots,
+                                       body.entry_mode, ltp, 0, body.side)
+            out.append(_place_tracked(ex, sym, qty, entry, body.target_points, body.stop_points,
+                                      body.strategy, body.trail_distance, body.product,
+                                      body.side, t_recv, tag=tag))
+        result = {"legs": out}
+        _idem_store(tag, result)
+        return result
 
 
 @router.get("/synthetic", dependencies=[Depends(require_user)])

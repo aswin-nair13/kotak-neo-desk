@@ -59,6 +59,16 @@ const closestStrike = (list, atm) => {
 
 const symOf = (instrument, expiry, strike, otype) => `${instrument}${expiry}${strike}${otype}`
 
+// M5: how long a placed order keeps its button locked if no terminal order-feed
+// event arrives (dropped feed safety net).
+const INFLIGHT_MS = 30000
+
+// compact, broker-safe per-click idempotency tag (Kotak echoes it as GuiOrdId)
+const newTag = () => {
+  const raw = (crypto.randomUUID && crypto.randomUUID()) || `${Date.now()}${Math.random()}`
+  return `t${raw.replace(/[^a-z0-9]/gi, '').slice(0, 15)}`
+}
+
 // click-to-fill latency formatting (client-measured wall clock)
 const fmtLat = (ms) => {
   if (ms == null || !Number.isFinite(ms) || ms < 0) return null
@@ -97,6 +107,29 @@ export default function App() {
   // server-internal place_order RTT. Two Date.now() calls per order — ~ns.
   const clickRef = useRef({})
   const [lat, setLat] = useState({})
+  // M5 in-flight lock: key -> true while the order is being placed/awaited.
+  // A click locks the triggering button(s); they re-enable when the entry hits
+  // a terminal state on the order feed, or after INFLIGHT_MS.
+  const [placing, setPlacing] = useState({})
+  const placeTimers = useRef({})
+  const pendingIds = useRef({}) // entry order id -> button lock key
+
+  const releaseKey = (key) => {
+    const t = placeTimers.current[key]
+    if (t) { clearTimeout(t); delete placeTimers.current[key] }
+    setPlacing((p) => {
+      if (!p[key]) return p
+      const n = { ...p }; delete n[key]; return n
+    })
+  }
+  const lockKey = (key) => {
+    setPlacing((p) => (p[key] ? p : { ...p, [key]: true }))
+    if (placeTimers.current[key]) clearTimeout(placeTimers.current[key])
+    placeTimers.current[key] = setTimeout(() => releaseKey(key), INFLIGHT_MS)
+  }
+  const notePending = (key, ids) => {
+    for (const id of ids) if (id) pendingIds.current[String(id)] = key
+  }
 
   const rememberClick = (entryId, clickMs, timing, symbol) => {
     if (!entryId) return
@@ -135,6 +168,15 @@ export default function App() {
         }
         if (m.kind === 'order' && m.order) {
           const od = m.order
+          // M5: release the button lock once this entry reaches a terminal state
+          const st = String(od.ordSt || '').toLowerCase()
+          const terminal = st === 'complete' || st === 'filled'
+            || st.includes('reject') || st.includes('cancel') || st.includes('expir')
+          const lockedBy = pendingIds.current[String(od.nOrdNo)]
+          if (lockedBy && terminal) {
+            releaseKey(lockedBy)
+            delete pendingIds.current[String(od.nOrdNo)]
+          }
           // stamp THIS update with its own arrival age (browser clock). The old
           // code kept one shared total per nOrdNo, so every row for an order
           // ended up showing the latest (COMPLETE) time — early rows like PUT
@@ -374,12 +416,15 @@ export default function App() {
   const needTicket = !kotakIn || !f.expiry
 
   const place = async (otype, side = 'B') => {
-    const tag = side === 'S' ? 'Sell' : 'Buy'
+    const label = side === 'S' ? 'Sell' : 'Buy'
+    const lockName = otype === 'BOTH' ? `BOTH-${side}` : `${otype}-${side}`
+    if (placing[lockName]) return
     const tClick = Date.now()
     const off = num(f.offset)
     if (f.entry_mode === 'L-1' && (!Number.isFinite(off) || off < 0)) {
       say('err', 'Set a valid Offset (>= 0) for L-1 entry.'); return
     }
+    const idemTag = newTag()
     try {
       if (otype === 'BOTH') {
         if (f.entry_mode === 'L') {
@@ -390,12 +435,15 @@ export default function App() {
         const ce = legLtp(ceSym) ?? ltp.ce ?? await quoteLeg('CE')
         const pe = legLtp(peSym) ?? ltp.pe ?? await quoteLeg('PE')
         if (ce == null || pe == null) { say('err', 'Need both CE and PE quotes first (press ↻).'); return }
-        const body = { ...f, side }
+        lockKey(lockName) // disable both straddle buttons until terminal/timeout
+        const body = { ...f, side, client_order_tag: idemTag }
         const r = await api.post(`/orders/straddle?ce_ltp=${ce}&pe_ltp=${pe}`, body, auth)
         const apiMs = Date.now() - tClick
-        for (const l of r.data.legs || []) rememberClick(l.entry_order_id, tClick, l.timing, l.symbol)
+        const ids = []
+        for (const l of r.data.legs || []) { rememberClick(l.entry_order_id, tClick, l.timing, l.symbol); ids.push(l.entry_order_id) }
+        notePending(lockName, ids)
         const b0 = r.data.legs?.[0]?.timing?.broker_rtt_ms
-        say('ok', `${tag} straddle placed: ${(r.data.legs || []).map((l) => l.symbol).join(' + ')} (api ${fmtLat(apiMs)}${b0 != null ? `, broker ${fmtLat(b0)}` : ''} — fill time lands in the feed below)`)
+        say('ok', `${label} straddle placed: ${(r.data.legs || []).map((l) => l.symbol).join(' + ')} (api ${fmtLat(apiMs)}${b0 != null ? `, broker ${fmtLat(b0)}` : ''} — fill time lands in the feed below)`)
       } else {
         const strike = otype === 'CE' ? f.ce_strike : f.pe_strike
         const sym = symOf(f.instrument, f.expiry, strike, otype)
@@ -409,19 +457,23 @@ export default function App() {
         const live = legLtp(sym)
         const price = live ?? (f.entry_mode === 'L' ? limit : await quoteLeg(otype))
         if (price == null) { say('err', `Need a ${otype} quote first (press ↻).`); return }
+        lockKey(lockName)
         const body = {
           ...f, option_type: otype, strike: String(strike), entry_offset: 0,
-          offset: off, limit_price: limit, side,
+          offset: off, limit_price: limit, side, client_order_tag: idemTag,
         }
         const r = await api.post(`/orders/single?ref_ltp=${price}`, body, auth)
         const apiMs = Date.now() - tClick
         rememberClick(r.data.entry_order_id, tClick, r.data.timing, r.data.symbol)
+        notePending(lockName, [r.data.entry_order_id])
         const b = r.data.timing?.broker_rtt_ms
-        say('ok', `${tag} ${r.data.symbol} @ ${r.data.entry} → TGT ${r.data.target} / SL ${r.data.stop} (api ${fmtLat(apiMs)}${b != null ? `, broker ${fmtLat(b)}` : ''} — fill time lands in the feed below)`)
+        say('ok', `${label} ${r.data.symbol} @ ${r.data.entry} → TGT ${r.data.target} / SL ${r.data.stop} (api ${fmtLat(apiMs)}${b != null ? `, broker ${fmtLat(b)}` : ''} — fill time lands in the feed below)`)
       }
       refreshData() // keep dropdowns + watchlist intact
     } catch (e) {
       say('err', `Order failed: ${e.response?.data?.detail || e.message}`)
+      // Leave the lock armed: the request may have reached the broker before the
+      // response failed. The terminal feed event or the 30s timeout releases it.
     }
   }
 
@@ -450,7 +502,7 @@ export default function App() {
         ...f, entry_mode: mode, target_points: leg.target_points,
         stop_points: leg.stop_points, offset: off, limit_price: limit,
         option_type: leg.otype, strike: String(leg.strike),
-        entry_offset: 0, side,
+        entry_offset: 0, side, client_order_tag: newTag(),
       }
       const r = await api.post(`/orders/single?ref_ltp=${price}`, body, auth)
       const apiMs = Date.now() - tClick
@@ -667,14 +719,18 @@ export default function App() {
         </div>
 
         <div className="row" style={{ marginTop: 14 }}>
-          <button className="btn buy" disabled={needTicket || !f.ce_strike} onClick={() => place('CE', 'B')}>Buy CE</button>
-          <button className="btn sell" disabled={needTicket || !f.ce_strike} onClick={() => place('CE', 'S')}>Sell CE</button>
-          <button className="btn buy" disabled={needTicket || !f.pe_strike} onClick={() => place('PE', 'B')}>Buy PE</button>
-          <button className="btn sell" disabled={needTicket || !f.pe_strike} onClick={() => place('PE', 'S')}>Sell PE</button>
-          <button className="btn" disabled={needTicket || !f.ce_strike || !f.pe_strike}
-            onClick={() => place('BOTH', 'B')}>Buy both (straddle)</button>
-          <button className="btn ghost" disabled={needTicket || !f.ce_strike || !f.pe_strike}
-            onClick={() => place('BOTH', 'S')}>Sell both</button>
+          <button className="btn buy" disabled={needTicket || !f.ce_strike || placing['CE-B']}
+            onClick={() => place('CE', 'B')}>{placing['CE-B'] ? '…' : 'Buy CE'}</button>
+          <button className="btn sell" disabled={needTicket || !f.ce_strike || placing['CE-S']}
+            onClick={() => place('CE', 'S')}>{placing['CE-S'] ? '…' : 'Sell CE'}</button>
+          <button className="btn buy" disabled={needTicket || !f.pe_strike || placing['PE-B']}
+            onClick={() => place('PE', 'B')}>{placing['PE-B'] ? '…' : 'Buy PE'}</button>
+          <button className="btn sell" disabled={needTicket || !f.pe_strike || placing['PE-S']}
+            onClick={() => place('PE', 'S')}>{placing['PE-S'] ? '…' : 'Sell PE'}</button>
+          <button className="btn" disabled={needTicket || !f.ce_strike || !f.pe_strike || placing['BOTH-B']}
+            onClick={() => place('BOTH', 'B')}>{placing['BOTH-B'] ? '…' : 'Buy both (straddle)'}</button>
+          <button className="btn ghost" disabled={needTicket || !f.ce_strike || !f.pe_strike || placing['BOTH-S']}
+            onClick={() => place('BOTH', 'S')}>{placing['BOTH-S'] ? '…' : 'Sell both'}</button>
         </div>
       </div>
 

@@ -251,6 +251,35 @@ class KotakService:
     def order_history(self, order_id: str):
         return self._require().order_history(order_id=str(order_id))
 
+    def average_fill_price(self, order_id: str) -> float | None:
+        """Average traded price for one order via order_history (None on failure).
+
+        Wraps `order_history` for the synthetic engine (Plan 04 H3): when a fill
+        frame lacks a usable price the engine fetches the order's real average
+        once instead of guessing the SL trigger from the planned entry.
+        """
+        try:
+            res = self.order_history(order_id)
+        except Exception as e:
+            log.error("order_history %s failed: %s", order_id, e)
+            return None
+        rows = res.get("data") if isinstance(res, dict) else res
+        if isinstance(rows, dict):
+            rows = [rows]
+        if not isinstance(rows, list):
+            return None
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            for k in ("avgPrc", "average_price", "avg_price", "prc", "avg"):
+                try:
+                    v = float(row.get(k))
+                    if v and v > 0:
+                        return v
+                except (TypeError, ValueError):
+                    continue
+        return None
+
     def session_check(self) -> dict:
         """Lightweight session-gated call (margin/limits need a trading session).
         Distinguishes 'session dead' (401 here too) from 'orders specifically broken'."""
