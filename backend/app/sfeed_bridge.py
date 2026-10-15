@@ -53,6 +53,39 @@ def map_order_data(d) -> dict:
     }
 
 
+def map_book_entry(d: dict) -> dict | None:
+    """Raw order-book row (Kotak `order_report()` JSON) -> same shape as
+    `map_order_data`, so `SyntheticEngine.reconcile` can re-drive it uniformly.
+    Tolerates the wire abbreviations (nOrdNo/ordSt/avgPrc/...) and the
+    long-form names. Returns None when there is no order id to key on."""
+    if not isinstance(d, dict):
+        return None
+
+    def g(*keys, default=""):
+        for k in keys:
+            v = d.get(k)
+            if v not in (None, ""):
+                return v
+        return default
+
+    oid = g("nOrdNo", "order_id", "orderId", "order_no")
+    if not oid:
+        return None
+    qty = g("qty", "quantity", default=0)
+    return {
+        "nOrdNo": str(oid),
+        "ordSt": str(g("ordSt", "order_status", "status", default="unknown")),
+        "trdSym": str(g("trdSym", "trading_symbol", "sym", "symbol")),
+        "trnsTp": str(g("trnsTp", "transaction_type", "transactionType")),
+        "qty": qty,
+        "brdLtQty": str(qty),
+        "prc": str(g("avgPrc", "average_price", "avgPrc", "prc", "price", default="0")),
+        "fldQty": g("fldQty", "filled_quantity", default=0),
+        "rejRsn": str(g("rejRsn", "reject_reason", default="--")),
+        "t_feed_ms": int(time.time() * 1000),
+    }
+
+
 class SFeedBridge:
     def __init__(self, hub, engine, kotak, retry_sec: float = 5.0):
         self.hub = hub
@@ -66,6 +99,7 @@ class SFeedBridge:
         self._thread: threading.Thread | None = None
         self._loop: asyncio.AbstractEventLoop | None = None
         self._ws = None
+        self._reconcile_lock: asyncio.Lock | None = None  # created on the bridge loop
 
     # ---------- lifecycle ----------
     def start(self):
@@ -118,24 +152,66 @@ class SFeedBridge:
             self._loop = None
 
     async def _supervise(self):
+        """Own both feed supervisors on one loop (Plan 03).
+
+        Market and order feeds have independent sessions + reconnect loops, so
+        a market-feed drop can no longer tear down the order feed (and
+        vice-versa). Each supervisor only exits when `self._stop` is set.
+        """
+        self._reconcile_lock = asyncio.Lock()
+        tasks = {
+            asyncio.create_task(self._supervise_market(), name="sfeed-market"),
+            asyncio.create_task(self._supervise_orders(), name="sfeed-orders"),
+        }
+        try:
+            while not self._stop.is_set():
+                done, _ = await asyncio.wait(tasks, timeout=0.5,
+                                             return_when=asyncio.FIRST_COMPLETED)
+                for t in done:  # supervisors are loops; a return is unexpected
+                    exc = t.exception()
+                    if exc is not None and not self._stop.is_set():
+                        log.error("feed supervisor %s died: %s", t.get_name(), exc)
+        finally:
+            for t in tasks:
+                t.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+    async def _supervise_market(self):
         while not self._stop.is_set():
             try:
-                await self._session()
+                await self._market_session()
+            except asyncio.CancelledError:
+                raise
             except Exception as e:
-                log.error("feed session ended: %s", e)
+                log.error("market session ended: %s", e)
             if not self._stop.is_set():
                 await asyncio.sleep(self.retry_sec)
 
-    async def _session(self):
+    async def _supervise_orders(self):
+        while not self._stop.is_set():
+            try:
+                await self._order_session()
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                log.error("order session ended: %s", e)
+            if not self._stop.is_set():
+                await asyncio.sleep(self.retry_sec)
+
+    async def _market_session(self):
         from neo_api_client.websocket.feed import WsToken
         client = self.kotak.client
         if client is None:
             raise RuntimeError("no Kotak client (login first)")
         base = [WsToken("nse_cm", "Nifty 50"), WsToken("bse_cm", "SENSEX")]
-        async with client.create_websocket() as ws:
+        # SDK auto-reconnect is disabled (max_reconnect_attempts=0): the
+        # supervisor owns reconnect, so an SDK reconnect window can't pre-empt
+        # `async for` (which used to end the whole session, order feed included).
+        async with client.create_websocket(max_reconnect_attempts=0) as ws:
             self._ws = ws
+            with self._lock:
+                self._subscribed.clear()  # a fresh socket forgot every sub
             await self._subscribe_wanted(ws, extra=base)
-            order_task = asyncio.create_task(self._consume_orders(client))
             try:
                 async for msg in ws:
                     tick = map_feed_message(msg)
@@ -149,7 +225,65 @@ class SFeedBridge:
                     self._push({"kind": "tick", "tick": tick})
             finally:
                 self._ws = None
-                order_task.cancel()
+
+    async def _order_session(self):
+        client = self.kotak.client
+        if client is None:
+            raise RuntimeError("no Kotak client (login first)")
+        async with client.create_order_feed(max_reconnect_attempts=0) as feed:
+            # Reconcile against the broker on every (re)connect: a fill/reject
+            # that landed during a feed gap is re-driven, so the protective SL
+            # is never silently missed.
+            await self._reconcile()
+            async for msg in feed:
+                self._handle_orderfeed_message(msg)
+
+    async def _reconcile(self):
+        """Re-derive missed order state from the broker after a (re)connect.
+
+        The broker fetch is blocking, so it runs in an executor (off the tick
+        path, backlog M2); the engine mutation is applied back on this loop,
+        serialized with tick/order handling. Guarded by a lock so a fast
+        reconnect can't overlap a still-running reconcile (backlog M3).
+        """
+        if self._stop.is_set():
+            return
+        loop = asyncio.get_running_loop()
+        if self._reconcile_lock is None:
+            self._reconcile_lock = asyncio.Lock()
+        async with self._reconcile_lock:
+            try:
+                book, positions = await loop.run_in_executor(None, self._fetch_book_positions)
+            except Exception as e:
+                log.error("reconcile fetch failed: %s", e)
+                return
+            try:
+                summary = self.engine.reconcile(book, positions)
+            except Exception as e:
+                log.error("reconcile apply failed: %s", e)
+                return
+        log.info("reconcile: checked=%s driven=%s errored=%s",
+                 summary.get("checked"), summary.get("driven"), summary.get("errored"))
+        self._push({"kind": "reconcile", "summary": summary})
+
+    def _fetch_book_positions(self):
+        book_rows = []
+        try:
+            raw = self.kotak.order_book()
+            if isinstance(raw, dict):
+                data = raw.get("data")
+                book_rows = data if isinstance(data, list) else []
+            elif isinstance(raw, list):
+                book_rows = raw
+        except Exception as e:
+            log.error("reconcile order_book failed: %s", e)
+        book = [m for m in (map_book_entry(r) for r in book_rows) if m]
+        try:
+            positions = self.kotak.positions() or {}
+        except Exception as e:
+            log.error("reconcile positions failed: %s", e)
+            positions = {}
+        return book, positions
 
     async def _subscribe_wanted(self, ws, extra=None):
         from neo_api_client.websocket.feed import WsToken
@@ -165,16 +299,6 @@ class SFeedBridge:
             log.info("subscribed %d scrips", len(toks))
         except Exception as e:
             log.error("subscribe failed: %s", e)
-
-    async def _consume_orders(self, client):
-        try:
-            async with client.create_order_feed() as feed:
-                async for msg in feed:
-                    self._handle_orderfeed_message(msg)
-        except asyncio.CancelledError:
-            pass
-        except Exception as e:
-            log.error("order feed ended: %s", e)
 
     def _handle_orderfeed_message(self, msg):
         name = type(msg).__name__

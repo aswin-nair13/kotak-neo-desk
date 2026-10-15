@@ -1,6 +1,7 @@
 # Plan 03 — Decouple Order Feed from Market Feed (H1)
 
-Status: **NOT IMPLEMENTED** · Priority: P0 (trading safety) · Scope:
+Status: **IMPLEMENTED** (with the minimal Plan 04 H3 idempotency guard;
+full Plan 04 still pending) · Priority: P0 (trading safety) · Scope:
 `backend/app/sfeed_bridge.py`, `backend/app/synthetic_engine.py`,
 `backend/app/ws_manager.py`, `backend/app/main.py`, `backend/app/routes/auth.py`.
 

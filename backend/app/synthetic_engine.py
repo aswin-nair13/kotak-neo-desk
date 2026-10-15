@@ -82,55 +82,18 @@ class SyntheticEngine:
         log.info("synthetic %s: %s -> %s (%s)", syn["trading_symbol"], oid, status, syn["status"])
 
         if oid == syn["entry_order_id"] and status == "complete" and syn["status"] == "PENDING_ENTRY":
-            # Recompute target/SL from the ACTUAL fill price, not the planned
-            # entry (ref_ltp+5). A planned stop can end up on the wrong side of
-            # the market (e.g. fill lower than planned -> SELL SL trigger above
-            # LTP), which the exchange rejects as 'STOP PRICE IS NOT REASONABLE'.
-            try:
-                side = syn.get("side", "B")
-                # stored distances (preferred) — fall back to deriving from plan
-                try:
-                    target_dist = float(syn.get("target_points", 0) or 0)
-                except (TypeError, ValueError):
-                    target_dist = 0.0
-                try:
-                    stop_dist = float(syn.get("stop_points", 0) or 0)
-                except (TypeError, ValueError):
-                    stop_dist = 0.0
-                fill = self._fill_price(od)
-                if fill and target_dist and stop_dist:
-                    if side == "S":  # short: profit when price falls
-                        target = max(0.05, fill - target_dist)
-                        stop = fill + stop_dist
-                    else:
-                        target = fill + target_dist
-                        stop = max(0.05, fill - stop_dist)
-                    syn["target_price"] = f"{target:.2f}"
-                    syn["stop_loss_price"] = f"{stop:.2f}"
-                    syn["fill_price"] = f"{fill:.2f}"
-                sl_txn = "B" if side == "S" else "S"
-                r = self.broker.place_stop_loss(syn["exchange_segment"], syn["quantity"],
-                                                syn["trading_symbol"], syn["stop_loss_price"],
-                                                transaction_type=sl_txn,
-                                                product=syn.get("product", "MIS"))
-                t_sl = int(time.time() * 1000)
-                if r and r.get("stCode") == 200:
-                    placed = syn.get("placed_at_ms")
-                    try:
-                        fill_lat = t_now - int(placed) if placed else None
-                    except (TypeError, ValueError):
-                        fill_lat = None
-                    syn.update(status="ACTIVE", sl_order_id=r.get("nOrdNo"),
-                               fill_at_ms=t_now, sl_placed_at_ms=t_sl)
-                    if fill_lat is not None and fill_lat >= 0:
-                        syn["fill_latency_ms"] = fill_lat
-                else:
-                    syn["status"] = "ERRORED"
-                    syn["error"] = str(r)[:300]
-            except Exception as e:
-                log.error("SL place failed: %s", e)
-                syn["status"] = "ERRORED"
-                syn["error"] = str(e)[:300]
+            self._place_sl(syn, od)
+
+        elif oid == syn["entry_order_id"] and syn["status"] == "PENDING_ENTRY" and "reject" in status:
+            # Entry never reached the book — no protective SL to place.
+            syn["status"] = "ERRORED"
+            syn["error"] = f"entry rejected: {od.get('rejRsn', '')}"
+            log.error("entry %s (%s) rejected: %s", syn["trading_symbol"], oid, od.get("rejRsn", ""))
+
+        elif oid == syn["entry_order_id"] and syn["status"] == "PENDING_ENTRY" \
+                and status in ("cancelled", "canceled", "expired"):
+            syn["status"] = "CLOSED"
+            syn["exit_reason"] = "ENTRY_" + status.upper()
 
         elif oid == syn.get("sl_order_id") and status == "complete" and syn["status"] != "CLOSED":
             syn["status"] = "CLOSED"
@@ -176,6 +139,128 @@ class SyntheticEngine:
         elif status == "complete" and syn["status"] == "CLOSING":
             syn["status"] = "CLOSED"
             syn["closed_at_ms"] = t_now
+
+    def _place_sl(self, syn: dict, od: dict):
+        """Place the protective SL for a filled entry, exactly once.
+
+        Idempotent (Plan 04 H3 guard): once `sl_placed`/`sl_order_id` is set a
+        re-driven event (duplicate feed frame or Plan 03 reconcile) is a no-op,
+        so a fill that arrived during a feed gap can never double-place an SL.
+
+        Recomputes target/SL from the ACTUAL fill price, not the planned entry
+        (ref_ltp+5). A planned stop can end up on the wrong side of the market
+        (e.g. fill lower than planned -> SELL SL trigger above LTP), which the
+        exchange rejects as 'STOP PRICE IS NOT REASONABLE'.
+        """
+        if syn.get("sl_placed") or syn.get("sl_order_id"):
+            return
+        syn["sl_placed"] = True
+        t_now = int(time.time() * 1000)
+        try:
+            side = syn.get("side", "B")
+            # stored distances (preferred) — fall back to deriving from plan
+            try:
+                target_dist = float(syn.get("target_points", 0) or 0)
+            except (TypeError, ValueError):
+                target_dist = 0.0
+            try:
+                stop_dist = float(syn.get("stop_points", 0) or 0)
+            except (TypeError, ValueError):
+                stop_dist = 0.0
+            fill = self._fill_price(od)
+            if fill and target_dist and stop_dist:
+                if side == "S":  # short: profit when price falls
+                    target = max(0.05, fill - target_dist)
+                    stop = fill + stop_dist
+                else:
+                    target = fill + target_dist
+                    stop = max(0.05, fill - stop_dist)
+                syn["target_price"] = f"{target:.2f}"
+                syn["stop_loss_price"] = f"{stop:.2f}"
+                syn["fill_price"] = f"{fill:.2f}"
+            sl_txn = "B" if side == "S" else "S"
+            r = self.broker.place_stop_loss(syn["exchange_segment"], syn["quantity"],
+                                            syn["trading_symbol"], syn["stop_loss_price"],
+                                            transaction_type=sl_txn,
+                                            product=syn.get("product", "MIS"))
+            t_sl = int(time.time() * 1000)
+            if r and r.get("stCode") == 200:
+                placed = syn.get("placed_at_ms")
+                try:
+                    fill_lat = t_now - int(placed) if placed else None
+                except (TypeError, ValueError):
+                    fill_lat = None
+                syn.update(status="ACTIVE", sl_order_id=r.get("nOrdNo"),
+                           fill_at_ms=t_now, sl_placed_at_ms=t_sl)
+                if fill_lat is not None and fill_lat >= 0:
+                    syn["fill_latency_ms"] = fill_lat
+            else:
+                syn["status"] = "ERRORED"
+                syn["error"] = str(r)[:300]
+        except Exception as e:
+            log.error("SL place failed: %s", e)
+            syn["status"] = "ERRORED"
+            syn["error"] = str(e)[:300]
+
+    def reconcile(self, book: list[dict], positions: dict | None = None) -> dict:
+        """Re-drive tracked legs against a fresh broker order book (Plan 03).
+
+        Called after every order-feed (re)connect so a fill/reject/SL event that
+        landed while the feed was down is not silently lost. Only legs still
+        awaiting a decision are driven, and SL placement is guarded (see
+        `_place_sl`), so running this on top of an already-processed fill is a
+        no-op. `book` is a list of TransTrader-shaped order dicts (see
+        `sfeed_bridge.map_book_entry`); `positions` is accepted for a UI
+        snapshot but is not used to auto-re-place SLs.
+
+        Returns a summary dict for the UI reconcile notice.
+        """
+        by_id: dict[str, dict] = {}
+        for od in book or []:
+            oid = od.get("nOrdNo")
+            if oid:
+                by_id[str(oid)] = od
+        driven: list[str] = []
+        errored: list[str] = []
+        for syn in list(self.orders.values()):
+            status = syn.get("status")
+            try:
+                if status == "PENDING_ENTRY":
+                    eid = str(syn.get("entry_order_id") or "")
+                    od = by_id.get(eid)
+                    if od:
+                        self.on_order_update(od)
+                        driven.append(eid)
+                elif status in ("ACTIVE", "TRAILING"):
+                    sl = str(syn.get("sl_order_id") or "")
+                    od = by_id.get(sl) if sl else None
+                    if od is None:
+                        syn["status"] = "ERRORED"
+                        syn["error"] = "SL order missing from broker book on reconcile"
+                        errored.append(sl)
+                        log.error("reconcile: %s leg %s SL %s missing -> ERRORED",
+                                  syn.get("trading_symbol"), syn.get("entry_order_id"), sl)
+                    else:
+                        st = str(od.get("ordSt", "")).lower()
+                        if st == "complete":
+                            self.on_order_update(od)  # position exited via SL
+                            driven.append(sl)
+                        elif "reject" in st or st in ("cancelled", "canceled", "expired"):
+                            syn["status"] = "ERRORED"
+                            syn["error"] = f"SL {sl} {st} on reconcile — position unprotected"
+                            errored.append(sl)
+                            log.error("reconcile: %s SL %s %s -> ERRORED (naked position)",
+                                      syn.get("trading_symbol"), sl, st)
+                elif status == "CLOSING":
+                    xid = str(syn.get("exit_order_id") or "")
+                    od = by_id.get(xid) if xid else None
+                    if od:
+                        self.on_order_update(od)
+                        driven.append(xid)
+            except Exception as e:
+                log.error("reconcile leg err: %s", e)
+        return {"checked": len(self.orders), "driven": driven, "errored": errored,
+                "positions": len(positions or {})}
 
     # -- price feed --
     def on_tick(self, tick: dict):
