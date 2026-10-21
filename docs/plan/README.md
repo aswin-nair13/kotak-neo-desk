@@ -15,6 +15,7 @@ frontend (`frontend/src/*`), deploy configs, and installed `kotakneoapi` 3.0.7.
 | 03 | [Decouple order feed from market feed](03-decouple-order-feed.md) | H1 | P0 (trading safety) |
 | 04 | [Order-execution integrity](04-order-execution-integrity.md) | H3, M5, M6 | P0 (trading safety) |
 | 05 | [Backlog — remaining findings](05-backlog-findings.md) | H2, M1–M4, Low, Perf | P2/P3 |
+| 06 | [Order-feed liveness, SL guarantee & exit integrity](06-order-feed-liveness-and-exit-integrity.md) | 2026-10-21 live incident: M2 root cause, feed watchdog, periodic reconcile, SL/exit guarantees, manual-action sync, in-app order cancel | P0 (trading safety) |
 
 Deferred by owner: **C6** (JWT hygiene — accepted for now), **H2** (state
 persistence — future separate storage session).
