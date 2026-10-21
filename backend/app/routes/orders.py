@@ -7,6 +7,7 @@ import time
 from fastapi import APIRouter, Depends, HTTPException
 
 from ..auth import require_user
+from ..broker_worker import WorkerQueueFull
 from ..config import settings
 from ..kotak_client import KotakService
 from ..schemas import ExitBody, SingleOrderBody, StraddleBody
@@ -21,6 +22,30 @@ kotak: KotakService | None = None
 engine: SyntheticEngine | None = None
 hub: Hub | None = None
 bridge = None  # SFeedBridge, wired in main.py
+worker = None  # CommandWorker, wired in main.py (None in unit tests -> direct)
+
+
+def _run_on_worker(fn, *args, label: str | None = None, **kwargs):
+    """Run a route-side command on the single writer and map timeout/backlog.
+
+    Place (broker call + engine.add) and exit (cancel + mark + market order)
+    must be one worker command, otherwise an order update can be processed
+    between the broker call and the engine registration.
+    """
+    if worker is None:
+        return fn(*args, **kwargs)
+    try:
+        return worker.submit_wait(
+            fn, *args, label=label or getattr(fn, "__name__", "command"), **kwargs)
+    except TimeoutError as e:
+        raise HTTPException(status_code=504, detail=f"Broker command timed out: {e}")
+    except WorkerQueueFull as e:
+        raise HTTPException(status_code=503, detail=f"Broker queue full: {e}")
+
+
+def _broker_call(fn, *args, label: str | None = None, **kwargs):
+    """Run a broker call on the single command worker when it is wired."""
+    return _run_on_worker(fn, *args, label=label, **kwargs)
 
 # M5 — server-side idempotency. The UI sends a per-click `client_order_tag`;
 # a duplicate (double-click / retry) with the same tag within the TTL returns
@@ -144,11 +169,14 @@ def _place_tracked(exchange, symbol, qty, entry, body_target, body_stop, strateg
     if tag:
         kw["tag"] = tag  # echoed by the broker as GuiOrdId; M5 dedupe marker
     t_b0 = _ms()
+    # Runs inside one _run_on_worker command together with engine.add below.
     r = kotak.place_order(**kw)
     t_b1 = _ms()
     if not (r and r.get("stCode") == 200):
         raise HTTPException(status_code=502, detail=f"Entry rejected for {symbol}: {r}")
     entry_id = r.get("nOrdNo")
+    log.info("entry order placed symbol=%s order=%s side=%s qty=%s",
+             symbol, entry_id, side, qty)
     if side == "S":
         target = max(0.05, float(entry) - float(body_target))
         stop = float(entry) + float(body_stop)
@@ -192,9 +220,10 @@ def place_single(body: SingleOrderBody, ref_ltp: float = 0):
         if replay is not None:
             log.info("idempotent replay: single tag=%s -> %s", tag, replay.get("entry_order_id"))
             return replay
-        result = _place_tracked(ex, sym, qty, entry, body.target_points, body.stop_points,
-                                body.strategy, body.trail_distance, body.product, body.side,
-                                t_recv, tag=tag)
+        result = _run_on_worker(
+            _place_tracked, ex, sym, qty, entry, body.target_points, body.stop_points,
+            body.strategy, body.trail_distance, body.product, body.side,
+            t_recv, tag=tag, label=f"place_single:{sym}")
         _idem_store(tag, result)
         return result
 
@@ -215,9 +244,10 @@ def place_straddle(body: StraddleBody, ce_ltp: float = 0, pe_ltp: float = 0):
         for otype, strike, ltp in (("CE", body.ce_strike, ce_ltp), ("PE", body.pe_strike, pe_ltp)):
             ex, sym, qty, entry = _leg(body.instrument, body.expiry, otype, strike, body.lots,
                                        body.entry_mode, ltp, 0, body.side)
-            out.append(_place_tracked(ex, sym, qty, entry, body.target_points, body.stop_points,
-                                      body.strategy, body.trail_distance, body.product,
-                                      body.side, t_recv, tag=tag))
+            out.append(_run_on_worker(
+                _place_tracked, ex, sym, qty, entry, body.target_points, body.stop_points,
+                body.strategy, body.trail_distance, body.product,
+                body.side, t_recv, tag=tag, label=f"place_straddle:{sym}"))
         result = {"legs": out}
         _idem_store(tag, result)
         return result
@@ -233,7 +263,9 @@ def list_synthetic():
 def orderbook():
     assert kotak is not None
     try:
-        return kotak.order_book()  # v3: order_report(); order_history() needs one order_id
+        return _broker_call(kotak.order_book)  # v3: order_report()
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=502, detail=str(e))
 
@@ -242,13 +274,20 @@ def orderbook():
 def cancel(order_id: str):
     assert kotak is not None
     try:
-        return kotak.cancel(order_id)
+        return _broker_call(kotak.cancel, order_id)
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=502, detail=str(e))
 
 
 @router.post("/exit-position", dependencies=[Depends(require_user)])
 def exit_position(body: ExitBody):
+    return _run_on_worker(_exit_position_impl, body,
+                          label=f"exit_position:{body.symbol.strip().upper()}")
+
+
+def _exit_position_impl(body: ExitBody):
     """Flatten one net position at market and stand down its bracket.
 
     1. sizes the exit from the live broker position (full net qty),
@@ -262,7 +301,7 @@ def exit_position(body: ExitBody):
     if not symbol:
         raise HTTPException(status_code=400, detail="symbol required")
     t_recv = _ms()
-    pos = kotak.positions().get(symbol)
+    pos = _broker_call(kotak.positions).get(symbol)
     if not pos:
         raise HTTPException(status_code=404, detail=f"No open position in {symbol}")
     try:
@@ -296,7 +335,7 @@ def exit_position(body: ExitBody):
             if not oid:
                 continue
             try:
-                kotak.cancel(str(oid))
+                _broker_call(kotak.cancel, str(oid))
                 cancelled.append({"order_id": str(oid), "what": key})
             except Exception as e:
                 cancelled.append({"order_id": str(oid), "what": key, "warn": str(e)[:200]})
@@ -304,8 +343,10 @@ def exit_position(body: ExitBody):
 
     t_b0 = _ms()
     try:
-        r = kotak.place_market_exit(exchange, str(shares), symbol,
-                                    transaction_type=exit_txn, product=product)
+        r = _broker_call(kotak.place_market_exit, exchange, str(shares), symbol,
+                         transaction_type=exit_txn, product=product)
+    except HTTPException:
+        raise
     except Exception as e:
         log.error("exit-position MKT failed for %s: %s", symbol, e)
         raise HTTPException(status_code=502, detail=f"Exit order failed for {symbol}: {e}")
@@ -326,6 +367,11 @@ def exit_position(body: ExitBody):
 
 @router.post("/modify-sl/{order_id}", dependencies=[Depends(require_user)])
 def modify_sl(order_id: str, trigger: float, quantity: str | None = None):
+    return _run_on_worker(_modify_sl_impl, order_id, trigger, quantity,
+                          label=f"modify_sl:{order_id}")
+
+
+def _modify_sl_impl(order_id: str, trigger: float, quantity: str | None):
     """v3 modify_order requires quantity — taken from the synthetic tracker if omitted.
     Limit side follows the leg: long legs hold a SELL SL, short legs a BUY SL."""
     assert kotak is not None and engine is not None
@@ -335,6 +381,9 @@ def modify_sl(order_id: str, trigger: float, quantity: str | None = None):
         raise HTTPException(status_code=400, detail="Pass ?quantity= (leg not tracked synthetically)")
     sl_txn = "B" if (syn and syn.get("side") == "S") else "S"
     try:
-        return kotak.modify_sl(order_id, qty, str(trigger), transaction_type=sl_txn)
+        return _broker_call(kotak.modify_sl, order_id, qty, str(trigger),
+                            transaction_type=sl_txn)
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=502, detail=str(e))

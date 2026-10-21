@@ -15,6 +15,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
 from .auth import IPAllowlistMiddleware, decode_user_token, origin_allowed
+from .broker_worker import CommandWorker
 from .config import ALLOWED_ORIGINS, settings
 from .kotak_client import KotakService
 from .routes import auth as auth_routes
@@ -45,9 +46,14 @@ async def lifespan(app: FastAPI):
 
 kotak = KotakService(consumer_key=settings.kotak_consumer_key)
 engine = SyntheticEngine(broker=kotak)
+worker = CommandWorker(
+    "engine-worker", max_queue=settings.broker_worker_queue,
+    stall_ms=int(settings.broker_stall_log_sec * 1000),
+    stop_timeout=settings.worker_stop_timeout_sec,
+    call_timeout=settings.broker_call_timeout_sec)
 hub = Hub()
 hub.set_engine(engine)
-bridge = SFeedBridge(hub=hub, engine=engine, kotak=kotak)
+bridge = SFeedBridge(hub=hub, engine=engine, kotak=kotak, worker=worker)
 
 app = FastAPI(title="KotakAPI Trader", lifespan=lifespan)
 app.add_middleware(IPAllowlistMiddleware)
@@ -66,6 +72,7 @@ orders_routes.kotak = kotak
 orders_routes.engine = engine
 orders_routes.hub = hub
 orders_routes.bridge = bridge
+orders_routes.worker = worker
 market_routes.kotak = kotak
 market_routes.bridge = bridge
 
@@ -76,8 +83,19 @@ app.include_router(market_routes.router, prefix="/api/market", tags=["market"])
 
 @app.get("/api/health")
 def health():
+    feed = bridge.health()
+    w = feed.get("worker", {})
     return {"ok": True, "build": BUILD, "kotak_logged_in": kotak.logged_in,
-            "synthetic_open": len([o for o in engine.all() if o["status"] not in ("CLOSED",)])}
+            "synthetic_open": len([o for o in engine.all() if o["status"] not in ("CLOSED",)]),
+            "order_age_ms": feed.get("order_age_ms"),
+            "tick_age_ms": feed.get("tick_age_ms"),
+            "last_reconcile_ms": feed.get("last_reconcile_ms"),
+            "last_reconcile_ok_ms": feed.get("last_reconcile_ok_ms"),
+            "last_reconcile_error": feed.get("last_reconcile_error"),
+            "feed": feed,
+            "worker": w,
+            "worker_queue_depth": w.get("queue_depth"),
+            "worker_last_error": w.get("last_error")}
 
 
 WS_AUTH_TIMEOUT_SEC = 3.0

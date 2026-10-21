@@ -86,6 +86,7 @@ export default function App() {
   const [masterOk, setMasterOk] = useState(false)
   const [kotakBusy, setKotakBusy] = useState(false)
   const [egressIp, setEgressIp] = useState(null)
+  const [health, setHealth] = useState(null)
   const [ticks, setTicks] = useState({})
   const [orders, setOrders] = useState([])
   const [synthetic, setSynthetic] = useState([])
@@ -203,6 +204,18 @@ export default function App() {
       } catch { /* ignore */ }
     }
     return () => ws.close()
+  }, [token])
+
+  /* feed/reconcile freshness (Plan 06 WP2) — compact topbar indicator */
+  useEffect(() => {
+    if (!token) return
+    let live = true
+    const load = () => api.get('/health').then(
+      (r) => { if (live) setHealth(r.data) },
+      () => { if (live) setHealth(null) })
+    load()
+    const id = setInterval(load, 5000)
+    return () => { live = false; clearInterval(id) }
   }, [token])
 
   /* positions auto-refresh while Kotak session is live */
@@ -588,6 +601,17 @@ export default function App() {
         <span className={`pill ${kotakIn ? 'on' : 'off'}`}>
           <span className="dot" />{kotakIn ? 'Kotak live' : 'Kotak logged out'}
         </span>
+        {health?.feed && (
+          <span className={`pill ${health.feed.stale || !health.feed.order_connected ? 'off' : 'on'}`}
+            title={`order feed age ${fmtLat(health.order_age_ms) ?? '—'}, ` +
+              `last reconcile ${fmtLat(health.feed.last_reconcile_age_ms) ?? '—'}, ` +
+              `worker queue ${health.worker?.queue_depth ?? 0}`}>
+            <span className="dot" />
+            {health.feed.stale ? 'Feed down'
+              : health.feed.quiet ? `Feed quiet ${fmtLat(health.order_age_ms) ?? '—'}`
+                : health.feed.order_connected ? `Feed ${fmtLat(health.order_age_ms) ?? '—'}` : 'Feed down'}
+          </span>
+        )}
         <span className="spacer" />
         <button className="btn ghost sm" onClick={() => refresh()}>Refresh</button>
         <button className="btn ghost sm" onClick={logout}>Logout</button>

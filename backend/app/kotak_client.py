@@ -70,8 +70,11 @@ class KotakService:
     def initiate_login(self):
         if NeoAPI is None:
             raise RuntimeError("kotakneoapi not installed (cd backend && uv sync)")
-        # Same style as SwingTrader KotakProvider: consumer_key + environment only.
-        self.pending_client = NeoAPI(consumer_key=self.consumer_key, environment="prod")
+        # Explicit transport timeout: the SDK default (plus retries) allowed the
+        # 2026-10-21 cancel to block for 61 s. Keep HTTP calls bounded.
+        self.pending_client = NeoAPI(
+            consumer_key=self.consumer_key, environment="prod",
+            timeout=settings.broker_call_timeout_sec)
         return True
 
     @staticmethod

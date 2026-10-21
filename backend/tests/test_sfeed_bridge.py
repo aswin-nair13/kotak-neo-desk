@@ -7,9 +7,14 @@ from unittest.mock import MagicMock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from app.sfeed_bridge import (SFeedBridge, map_book_entry,  # noqa: E402
-                              map_feed_message, map_order_data)
-from app.synthetic_engine import SyntheticEngine  # noqa: E402
+from app.config import settings
+from app.sfeed_bridge import (
+    SFeedBridge,
+    map_book_entry,
+    map_feed_message,
+    map_order_data,
+)
+from app.synthetic_engine import SyntheticEngine
 
 
 class SFeedScrip:
@@ -198,11 +203,17 @@ def test_reconcile_terminal_entry_states():
     assert broker.place_stop_loss.call_count == 0  # never placed on a dead entry
 
 
-def test_reconcile_marks_naked_when_sl_missing_or_dead():
+def test_reconcile_marks_naked_when_sl_missing_or_dead(monkeypatch):
+    monkeypatch.setattr(settings, "sl_visibility_grace_sec", 0.05)
+    monkeypatch.setattr(settings, "sl_missing_confirmations", 2)
     broker = MagicMock()
     eng = SyntheticEngine(broker=broker)
     eng.add(_pending_leg("E1", status="ACTIVE", sl_order_id="SL9"))
-    eng.reconcile([], {})  # tracked SL absent from the whole book
+    eng.reconcile([], {})  # one empty/lagging frame is not proof
+    assert eng.orders["E1"]["status"] == "ACTIVE"
+    assert eng.orders["E1"]["sl_missing_streak"] == 1
+    time.sleep(0.06)
+    eng.reconcile([], {})
     assert eng.orders["E1"]["status"] == "ERRORED"
     assert "missing" in eng.orders["E1"]["error"]
 

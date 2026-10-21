@@ -43,6 +43,21 @@ class Settings(BaseSettings):
     sensex_lot: int = 20
     positions_poll_sec: int = 30
 
+    # Order-feed liveness + periodic reconcile (Plan 06 WP2).
+    feed_stale_sec: float = 30.0       # message-silence WARNING threshold
+    feed_watchdog_sec: float = 5.0     # how often the watchdog checks liveness
+    # Conservative idle fallback when the SDK exposes no connection signal.
+    feed_idle_reconnect_sec: float = 300.0
+    reconcile_sec: float = 30.0        # periodic broker reconcile interval
+    # Reconcile safety: never treat one missing SL as proof it is gone.
+    sl_visibility_grace_sec: float = 10.0
+    sl_missing_confirmations: int = 2
+    # Single-writer worker (Plan 06 WP1).
+    broker_worker_queue: int = 1000
+    broker_call_timeout_sec: float = 10.0
+    broker_stall_log_sec: float = 5.0  # log an ERROR when a command exceeds this
+    worker_stop_timeout_sec: float = 5.0
+
 
 settings = Settings()
 

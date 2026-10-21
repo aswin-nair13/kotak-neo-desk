@@ -12,7 +12,18 @@ import logging
 import threading
 import time
 
+from .broker_worker import CommandWorker
+from .config import settings
+
 log = logging.getLogger("sfeed")
+
+
+def _now_ms() -> int:
+    return int(time.time() * 1000)
+
+
+class OrderFeedStale(RuntimeError):
+    """The SDK reported a dead/disconnected order feed — force a new session."""
 
 
 # ---------- pure mappers (dispatch on type name so tests need no SDK) ----------
@@ -87,19 +98,56 @@ def map_book_entry(d: dict) -> dict | None:
 
 
 class SFeedBridge:
-    def __init__(self, hub, engine, kotak, retry_sec: float = 5.0):
+    def __init__(self, hub, engine, kotak, retry_sec: float = 5.0, worker=None,
+                 feed_stale_sec: float | None = None,
+                 feed_watchdog_sec: float | None = None,
+                 feed_idle_reconnect_sec: float | None = None,
+                 reconcile_sec: float | None = None):
         self.hub = hub
         self.engine = engine
         self.kotak = kotak
         self.retry_sec = retry_sec
+        self.feed_stale_sec = float(
+            settings.feed_stale_sec if feed_stale_sec is None else feed_stale_sec)
+        self.feed_watchdog_sec = max(0.01, float(
+            settings.feed_watchdog_sec if feed_watchdog_sec is None else feed_watchdog_sec))
+        self.feed_idle_reconnect_sec = float(
+            settings.feed_idle_reconnect_sec
+            if feed_idle_reconnect_sec is None else feed_idle_reconnect_sec)
+        self.reconcile_sec = max(0.01, float(
+            settings.reconcile_sec if reconcile_sec is None else reconcile_sec))
+        self.worker = worker or CommandWorker(
+            "engine-worker", max_queue=settings.broker_worker_queue,
+            stall_ms=int(settings.broker_stall_log_sec * 1000),
+            stop_timeout=settings.worker_stop_timeout_sec,
+            call_timeout=settings.broker_call_timeout_sec)
         self._lock = threading.Lock()
         self._wanted: set[tuple[str, str]] = set()  # (exchange, token) option legs
         self._subscribed: set[tuple[str, str]] = set()  # wanted legs already on the live ws
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
+        self._scheduler_thread: threading.Thread | None = None
         self._loop: asyncio.AbstractEventLoop | None = None
         self._ws = None
-        self._reconcile_lock: asyncio.Lock | None = None  # created on the bridge loop
+        self._started = False
+        # Freshness / reconcile state (read by /api/health from FastAPI threads).
+        self._last_order_msg_ms: int | None = None
+        self._last_order_ok_ms: int | None = None
+        self._last_order_applied_ms: int | None = None
+        self._last_order_liveness_ms: int | None = None
+        self._last_tick_ms: int | None = None
+        self._last_reconcile_attempt_ms: int | None = None
+        self._last_reconcile_ms: int | None = None
+        self._last_reconcile_ok_ms: int | None = None
+        self._last_reconcile_error: str | None = None
+        self._last_reconcile_error_ms: int | None = None
+        self._last_reconcile_summary: dict = {}
+        self._order_connected = False
+        self._watchdog_reconnects = 0
+        self._quiet_warned = False
+        self._reconcile_state_lock = threading.Lock()
+        self._reconcile_queued = 0
+        self._reconcile_pending_force = False
 
     # ---------- lifecycle ----------
     def start(self):
@@ -111,17 +159,153 @@ class SFeedBridge:
                         and o.get("instrument_token"):
                     self._wanted.add((o["exchange_segment"], str(o["instrument_token"])))
         self._stop.clear()
+        self._started = True
+        self._last_order_msg_ms = None
+        self._last_order_ok_ms = None
+        self._last_order_applied_ms = None
+        self._last_order_liveness_ms = None
+        self._last_tick_ms = None
+        self._last_reconcile_attempt_ms = None
+        self._last_reconcile_ms = None
+        self._last_reconcile_ok_ms = None
+        self._last_reconcile_error = None
+        self._last_reconcile_error_ms = None
+        self._last_reconcile_summary = {}
+        self._order_connected = False
+        self._watchdog_reconnects = 0
+        self._quiet_warned = False
+        self.worker.start()
+        self._scheduler_thread = threading.Thread(
+            target=self._scheduler_loop, name="reconcile-sched", daemon=True)
+        self._scheduler_thread.start()
         self._thread = threading.Thread(target=self._run, name="sfeed", daemon=True)
         self._thread.start()
-        log.info("SFeed bridge started (wanted options: %d)", len(self._wanted))
+        log.info("SFeed bridge started (wanted options: %d, stale=%ss, reconcile=%ss)",
+                 len(self._wanted), self.feed_stale_sec, self.reconcile_sec)
 
     def stop(self):
         self._stop.set()
         with self._lock:
             self._subscribed.clear()  # next session resubscribes the full set
+        sched, self._scheduler_thread = self._scheduler_thread, None
+        if sched and sched.is_alive() and sched is not threading.current_thread():
+            sched.join(timeout=2)
         th, self._thread = self._thread, None
-        if th and th.is_alive():
+        if th and th.is_alive() and th is not threading.current_thread():
             th.join(timeout=10)
+        self.worker.stop()
+        self._started = False
+        with self._reconcile_state_lock:
+            self._reconcile_queued = 0
+            self._reconcile_pending_force = False
+
+    # ---------- periodic reconcile ----------
+    def _scheduler_loop(self):
+        while not self._stop.wait(self.reconcile_sec):
+            try:
+                self._schedule_reconcile("periodic")
+            except Exception as e:  # noqa: BLE001 - scheduler must survive one bad tick
+                log.error("periodic reconcile schedule failed: %s", e)
+
+    def _schedule_reconcile(self, source: str, force: bool = False) -> bool:
+        """Queue a reconcile without blocking; at most one pending/running.
+
+        A `force` request that arrives while one is already queued sets a flag
+        instead of enqueueing a second command, so connect storms cannot pile up.
+        """
+        if self._stop.is_set():
+            return False
+        with self._reconcile_state_lock:
+            if self._reconcile_queued:
+                if force:
+                    self._reconcile_pending_force = True
+                return False
+            self._reconcile_queued = 1
+        ok = self.worker.submit(
+            self._run_reconcile, source, critical=True,
+            label=f"reconcile:{source}", allow_inline=False)
+        if not ok:
+            with self._reconcile_state_lock:
+                self._reconcile_queued = 0
+                self._reconcile_pending_force = False
+            log.warning("reconcile (%s) not queued: worker unavailable", source)
+        return ok
+
+    def _run_reconcile(self, source: str):
+        """Runs on the worker: broker fetch + engine mutation, serialized."""
+        try:
+            if self._stop.is_set():
+                return
+            self._last_reconcile_attempt_ms = _now_ms()
+            book, positions, ok = self._fetch_book_positions()
+            if not ok:
+                # A failed fetch is NOT an empty book. Authoritative reconcile
+                # here would mark every live SL as gone and drive duplicates.
+                self._last_reconcile_error = "order_book_unavailable"
+                self._last_reconcile_error_ms = _now_ms()
+                log.warning("reconcile (%s) skipped: order book unavailable", source)
+                return
+            try:
+                summary = self.engine.reconcile(book, positions)
+            except Exception as e:  # noqa: BLE001
+                self._last_reconcile_error = f"apply:{type(e).__name__}"
+                self._last_reconcile_error_ms = _now_ms()
+                log.error("reconcile apply failed: %s", e)
+                return
+            done = _now_ms()
+            self._last_reconcile_ms = done
+            self._last_reconcile_ok_ms = done
+            self._last_reconcile_error = None
+            self._last_reconcile_summary = dict(summary)
+            log.info("reconcile (%s): checked=%s driven=%s repaired=%s errored=%s naked=%s",
+                     source, summary.get("checked"), summary.get("driven"),
+                     summary.get("repaired"), summary.get("errored"),
+                     summary.get("naked"))
+            self._push({"kind": "reconcile", "summary": summary})
+        finally:
+            rerun = False
+            with self._reconcile_state_lock:
+                self._reconcile_queued = 0
+                if self._reconcile_pending_force and not self._stop.is_set():
+                    self._reconcile_pending_force = False
+                    rerun = True
+            if rerun:
+                self._schedule_reconcile("forced", force=True)
+
+    # ---------- health ----------
+    def health(self) -> dict:
+        now = _now_ms()
+
+        def age(ts):
+            return None if ts is None else max(0, now - int(ts))
+
+        order_age = age(self._last_order_msg_ms)
+        threshold = int(self.feed_stale_sec * 1000)
+        quiet = bool(self._started and self._order_connected
+                     and (order_age is None or order_age >= threshold))
+        stale = bool(self._started and not self._order_connected)
+        return {
+            "started": self._started,
+            "order_connected": self._order_connected,
+            "stale": stale,
+            "quiet": quiet,
+            "order_age_ms": order_age,
+            "tick_age_ms": age(self._last_tick_ms),
+            "last_order_msg_ms": self._last_order_msg_ms,
+            "last_order_ok_ms": self._last_order_ok_ms,
+            "last_order_applied_ms": self._last_order_applied_ms,
+            "last_order_liveness_ms": self._last_order_liveness_ms,
+            "last_tick_ms": self._last_tick_ms,
+            "last_reconcile_attempt_ms": self._last_reconcile_attempt_ms,
+            "last_reconcile_ms": self._last_reconcile_ms,
+            "last_reconcile_ok_ms": self._last_reconcile_ok_ms,
+            "last_reconcile_age_ms": age(self._last_reconcile_ms),
+            "last_reconcile_error": self._last_reconcile_error,
+            "last_reconcile_error_ms": self._last_reconcile_error_ms,
+            "last_reconcile": dict(self._last_reconcile_summary),
+            "watchdog_reconnects": self._watchdog_reconnects,
+            "worker": self.worker.status(),
+        }
 
     def ensure_option(self, exchange: str, token: str | None):
         """Subscribe one more option leg (called when a tracked order is placed,
@@ -158,7 +342,6 @@ class SFeedBridge:
         a market-feed drop can no longer tear down the order feed (and
         vice-versa). Each supervisor only exits when `self._stop` is set.
         """
-        self._reconcile_lock = asyncio.Lock()
         tasks = {
             asyncio.create_task(self._supervise_market(), name="sfeed-market"),
             asyncio.create_task(self._supervise_orders(), name="sfeed-orders"),
@@ -217,11 +400,9 @@ class SFeedBridge:
                     tick = map_feed_message(msg)
                     if tick is None:
                         continue
-                    try:
-                        self.hub.latest[tick["tk"]] = tick
-                        self.engine.on_tick(tick)
-                    except Exception as e:
-                        log.error("tick handle err: %s", e)
+                    self._last_tick_ms = _now_ms()
+                    self.hub.latest[tick["tk"]] = tick
+                    self.worker.submit(self._apply_tick, tick, label="on_tick")
                     self._push({"kind": "tick", "tick": tick})
             finally:
                 self._ws = None
@@ -231,50 +412,112 @@ class SFeedBridge:
         if client is None:
             raise RuntimeError("no Kotak client (login first)")
         async with client.create_order_feed(max_reconnect_attempts=0) as feed:
-            # Reconcile against the broker on every (re)connect: a fill/reject
-            # that landed during a feed gap is re-driven, so the protective SL
-            # is never silently missed.
-            await self._reconcile()
-            async for msg in feed:
-                self._handle_orderfeed_message(msg)
+            # Reader only reads. The engine applies each event on the worker via
+            # _handle_orderfeed_message, so a broker call can never block this
+            # loop (the 2026-10-21 61 s cancel starved it and killed the feed).
+            self._order_connected = True
+            self._last_order_msg_ms = _now_ms()
+            self._last_order_ok_ms = self._last_order_msg_ms
+            self._last_order_liveness_ms = self._last_order_msg_ms
+            self._quiet_warned = False
+            log.info("order feed connected — scheduling reconcile")
+            self._schedule_reconcile("connect", force=True)
+            reader = asyncio.create_task(self._read_order_feed(feed),
+                                         name="sfeed-order-reader")
+            try:
+                while True:
+                    done, _ = await asyncio.wait(
+                        {reader}, timeout=self.feed_watchdog_sec,
+                        return_when=asyncio.FIRST_COMPLETED)
+                    if reader in done:
+                        exc = reader.exception()
+                        if exc is not None:
+                            raise exc
+                        return
+                    if self._watchdog_tick(feed):
+                        raise OrderFeedStale("order feed disconnected")
+            finally:
+                self._order_connected = False
+                self._quiet_warned = False
+                reader.cancel()
+                await asyncio.gather(reader, return_exceptions=True)
 
-    async def _reconcile(self):
-        """Re-derive missed order state from the broker after a (re)connect.
+    def _watchdog_tick(self, feed) -> bool:
+        """True only when the feed is genuinely dead (force a reconnect).
 
-        The broker fetch is blocking, so it runs in an executor (off the tick
-        path, backlog M2); the engine mutation is applied back on this loop,
-        serialized with tick/order handling. Guarded by a lock so a fast
-        reconnect can't overlap a still-running reconcile (backlog M3).
+        Message silence alone is not death: Kotak can legally stay quiet for
+        minutes. Prefer the SDK's `is_connected`; fall back to a conservative
+        idle timeout when the SDK exposes no signal.
         """
-        if self._stop.is_set():
-            return
-        loop = asyncio.get_running_loop()
-        if self._reconcile_lock is None:
-            self._reconcile_lock = asyncio.Lock()
-        async with self._reconcile_lock:
-            try:
-                book, positions = await loop.run_in_executor(None, self._fetch_book_positions)
-            except Exception as e:
-                log.error("reconcile fetch failed: %s", e)
-                return
-            try:
-                summary = self.engine.reconcile(book, positions)
-            except Exception as e:
-                log.error("reconcile apply failed: %s", e)
-                return
-        log.info("reconcile: checked=%s driven=%s errored=%s",
-                 summary.get("checked"), summary.get("driven"), summary.get("errored"))
-        self._push({"kind": "reconcile", "summary": summary})
+        now = _now_ms()
+        connected = getattr(feed, "is_connected", None)
+        if not isinstance(connected, bool):
+            connected = None
+        last_msg = self._last_order_msg_ms
+        if connected is False:
+            self._watchdog_reconnects += 1
+            log.error("order feed reports disconnected — forcing reconnect")
+            return True
+        if connected is True:
+            self._last_order_liveness_ms = now
+            self._last_order_ok_ms = now
+            msg_age = now - (last_msg if last_msg is not None else now)
+            if msg_age >= self.feed_stale_sec * 1000:
+                if not self._quiet_warned:
+                    log.warning("order feed quiet for %dms but still connected "
+                                "(threshold %dms); not reconnecting",
+                                msg_age, int(self.feed_stale_sec * 1000))
+                    self._quiet_warned = True
+            else:
+                self._quiet_warned = False
+            return False
+        idle = now - (last_msg if last_msg is not None else now)
+        if idle >= self.feed_idle_reconnect_sec * 1000:
+            self._watchdog_reconnects += 1
+            log.error("order feed idle for %dms with no connection signal "
+                      "(threshold %dms) — forcing reconnect",
+                      idle, int(self.feed_idle_reconnect_sec * 1000))
+            return True
+        if idle >= self.feed_stale_sec * 1000 and not self._quiet_warned:
+            log.warning("order feed quiet for %dms; SDK exposes no liveness "
+                        "signal, waiting up to %ss before reconnecting",
+                        idle, self.feed_idle_reconnect_sec)
+            self._quiet_warned = True
+        return False
+
+    async def _read_order_feed(self, feed):
+        async for msg in feed:
+            self._last_order_msg_ms = _now_ms()
+            self._quiet_warned = False
+            self._handle_orderfeed_message(msg)
 
     def _fetch_book_positions(self):
+        """Return (book, positions, book_ok).
+
+        `book_ok=False` means the order book could not be read authoritatively
+        (exception/timeout/unexpected shape). The caller must skip reconcile:
+        an empty list here is not the same as "no live orders".
+        """
         book_rows = []
+        book_ok = False
         try:
             raw = self.kotak.order_book()
             if isinstance(raw, dict):
                 data = raw.get("data")
-                book_rows = data if isinstance(data, list) else []
+                error = any(
+                    isinstance(v, str) and k.lower() in
+                    ("error", "error message", "errmsg", "error_msg")
+                    for k, v in raw.items())
+                if isinstance(data, list):
+                    book_rows = data
+                    book_ok = True
+                elif data is None and "data" in raw and not error:
+                    # SDK success shape for "no orders today": authoritative
+                    # empty book, not a failed fetch.
+                    book_ok = True
             elif isinstance(raw, list):
                 book_rows = raw
+                book_ok = True
         except Exception as e:
             log.error("reconcile order_book failed: %s", e)
         book = [m for m in (map_book_entry(r) for r in book_rows) if m]
@@ -283,7 +526,7 @@ class SFeedBridge:
         except Exception as e:
             log.error("reconcile positions failed: %s", e)
             positions = {}
-        return book, positions
+        return book, positions, book_ok
 
     async def _subscribe_wanted(self, ws, extra=None):
         from neo_api_client.websocket.feed import WsToken
@@ -300,16 +543,30 @@ class SFeedBridge:
         except Exception as e:
             log.error("subscribe failed: %s", e)
 
+    def _apply_tick(self, tick: dict):
+        try:
+            self.engine.on_tick(tick)
+        except Exception as e:
+            log.error("tick handle err: %s", e)
+
+    def _apply_order_update(self, od: dict):
+        try:
+            self.engine.on_order_update(od)
+        except Exception as e:
+            log.error("engine order err: %s", e)
+        finally:
+            now = _now_ms()
+            self._last_order_applied_ms = now
+            self._last_order_ok_ms = now
+
     def _handle_orderfeed_message(self, msg):
         name = type(msg).__name__
         data = getattr(msg, "data", None)
         if name == "OrderUpdate" and data is not None:
             od = map_order_data(data)
             if od.get("nOrdNo"):
-                try:
-                    self.engine.on_order_update(od)
-                except Exception as e:
-                    log.error("engine order err: %s", e)
+                self.worker.submit(self._apply_order_update, od,
+                                   critical=True, label="on_order_update")
                 self._push({"kind": "order", "order": od})
         elif name == "PositionUpdate" and data is not None:
             d = data.__dict__ if hasattr(data, "__dict__") else {}
