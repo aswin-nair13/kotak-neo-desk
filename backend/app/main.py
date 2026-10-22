@@ -54,6 +54,12 @@ worker = CommandWorker(
 hub = Hub()
 hub.set_engine(engine)
 bridge = SFeedBridge(hub=hub, engine=engine, kotak=kotak, worker=worker)
+# Cancel confirmation (Plan 06 WP4) reads the book through the same worker-safe
+# path reconcile uses; the engine never calls the SDK from a tick/feed thread.
+engine.book_fetcher = bridge.fetch_book
+# Exit state machine follow-up: the engine never sleeps/polls on the worker; it
+# asks the bridge to queue one confirm reconcile after a cancel/exit step.
+engine.exit_poll_requester = bridge.request_exit_poll
 
 app = FastAPI(title="KotakAPI Trader", lifespan=lifespan)
 app.add_middleware(IPAllowlistMiddleware)
@@ -85,8 +91,13 @@ app.include_router(market_routes.router, prefix="/api/market", tags=["market"])
 def health():
     feed = bridge.health()
     w = feed.get("worker", {})
+    legs = engine.all()
     return {"ok": True, "build": BUILD, "kotak_logged_in": kotak.logged_in,
-            "synthetic_open": len([o for o in engine.all() if o["status"] not in ("CLOSED",)]),
+            "synthetic_open": len([o for o in legs if o["status"] not in ("CLOSED",)]),
+            "naked_legs": len([o for o in legs
+                              if o.get("naked_position") and not o.get("exit_pending")]),
+            "blocked_legs": len([o for o in legs if o.get("blocked_reason")]),
+            "errored_legs": len([o for o in legs if o["status"] == "ERRORED"]),
             "order_age_ms": feed.get("order_age_ms"),
             "tick_age_ms": feed.get("tick_age_ms"),
             "last_reconcile_ms": feed.get("last_reconcile_ms"),

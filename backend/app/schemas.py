@@ -1,4 +1,5 @@
 from typing import Literal
+
 from pydantic import BaseModel, Field
 
 
@@ -79,3 +80,9 @@ class ExitBody(BaseModel):
     # product defaults to the tracked leg's product (or broker position's),
     # override only if you moved the position across products.
     product: str | None = None
+
+
+class ForceExitBody(BaseModel):
+    """Operator-confirmed flatten for a blocked/ERRORED synthetic leg."""
+    entry_order_id: str = Field(min_length=1, max_length=64)
+    reason: str = Field(default="operator force exit", max_length=300)

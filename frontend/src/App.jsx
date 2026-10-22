@@ -103,6 +103,7 @@ export default function App() {
   const [px, setPx] = useState({})
   const [busyKey, setBusyKey] = useState('')
   const [exiting, setExiting] = useState('')
+  const [forcing, setForcing] = useState('')
   // click-to-fill latency: clickRef maps nOrdNo -> { clickMs, brokerMs, symbol };
   // lat maps nOrdNo -> { totalMs, brokerMs } computed when the ws update lands.
   // totalMs uses the browser clock only (no server skew); brokerMs is the
@@ -574,6 +575,32 @@ export default function App() {
     }
   }
 
+  // Operator escape hatch for EXIT_BLOCKED_SL_STILL_WORKING / naked legs.
+  // The server still cancels + confirms the SL before firing one market exit,
+  // so this cannot double-exit; it supplies the explicit human confirmation.
+  const forceExit = async (entryId, symbol, blocked) => {
+    if (!window.confirm(
+      `FORCE EXIT ${symbol}?\n\n${blocked || 'Leg is ERRORED/blocked.'}\n` +
+      'The server will cancel the SL, confirm it is terminal, then place ONE market exit. ' +
+      'This is audited (user/time/order/reason).')) return
+    setForcing(entryId)
+    try {
+      const r = await api.post('/orders/force-exit', {
+        entry_order_id: entryId,
+        reason: blocked || 'operator force exit',
+      }, auth)
+      say('ok', `Force exit ${symbol}: ${r.data.result}` +
+        `${r.data.leg?.exit_order_id ? ` (exit ${r.data.leg.exit_order_id})` : ''}`)
+      refreshData()
+    } catch (e) {
+      const d = e.response?.data
+      say('err', `Force exit blocked: ${d?.result || d?.detail || e.message}`)
+      refreshData()
+    } finally {
+      setForcing('')
+    }
+  }
+
   /* ---- render ---- */
   if (!token) return (
     <div className="page">
@@ -826,19 +853,51 @@ export default function App() {
         <p className="sub">Synthetic SL / target state per entry order. Fill lat = broker accept → exchange fill (server clock).</p>
         {synthetic.length === 0 ? <div className="empty">No working legs.</div> : (
           <table className="tbl"><thead><tr>
-            <th>Symbol</th><th>Side</th><th>Qty</th><th>Target</th><th>Stop</th><th>Strategy</th><th>Status</th><th>Fill lat</th>
+            <th>Symbol</th><th>Side</th><th>Qty</th><th>Target</th><th>Stop</th><th>Strategy</th><th>Status</th><th>Safety</th><th>Fill lat</th>
           </tr></thead><tbody>
-            {synthetic.map((o) => (
-              <tr key={o.entry_order_id}>
-                <td>{o.trading_symbol}</td>
-                <td>{o.side === 'S' ? 'SELL' : 'BUY'}</td>
-                <td>{o.quantity}</td>
-                <td>{o.target_price}</td><td>{o.stop_loss_price}</td>
-                <td>{o.strategy}</td>
-                <td><span className={`st ${o.status}`} title={o.error || ''}>{o.status}</span></td>
-                <td className="ltp">{fmtLat(o.fill_latency_ms) ?? '—'}</td>
-              </tr>
-            ))}
+            {synthetic.map((o) => {
+              const canForce = o.naked_position || o.exit_ambiguous || [
+                'EXIT_BLOCKED_SL_STILL_WORKING', 'EXIT_REJECTED', 'EXIT_CANCELLED',
+                'EXIT_UNKNOWN', 'EXIT_AMBIGUOUS', 'POSITION_MISMATCH', 'SL_MISSING',
+                'SL_TERMINAL', 'SL_PLACEMENT_REJECTED',
+              ].includes(o.blocked_reason)
+              return (
+                <tr key={o.entry_order_id}>
+                  <td>{o.trading_symbol}</td>
+                  <td>{o.side === 'S' ? 'SELL' : 'BUY'}</td>
+                  <td>{o.quantity}</td>
+                  <td>{o.target_price}</td><td>{o.stop_loss_price}</td>
+                  <td>{o.strategy}</td>
+                  <td><span className={`st ${o.status}`} title={o.error || ''}>{o.status}</span></td>
+                  <td>
+                    {o.naked_position && !o.exit_pending && <span className="st ERRORED" title={o.error || 'naked position'}>NAKED</span>}
+                    {o.exit_pending && <span className="st ACTIVE" title={o.exit_order_id ? `exit ${o.exit_order_id} working` : 'exit pending'}>EXIT PENDING</span>}
+                    {o.blocked_reason && o.blocked_reason !== 'EXIT_BLOCKED_SL_STILL_WORKING' &&
+                      <span className="st PENDING_ENTRY" title={o.error || o.blocked_reason}>{o.blocked_reason}</span>}
+                    {o.blocked_reason === 'EXIT_BLOCKED_SL_STILL_WORKING' &&
+                      <span className="st ERRORED" title={o.error || ''}>EXIT BLOCKED</span>}
+                    {canForce && (
+                      <button className="btn sell sm" style={{ marginLeft: 6 }}
+                        disabled={forcing === o.entry_order_id}
+                        onClick={() => forceExit(o.entry_order_id, o.trading_symbol, o.error || o.blocked_reason)}>
+                        {forcing === o.entry_order_id ? '…' : 'Force exit'}
+                      </button>
+                    )}
+                    <span className="ltp" style={{ marginLeft: 6 }}
+                      title={`SL guarantee due ${o.sl_guarantee_due_ms ? new Date(o.sl_guarantee_due_ms).toLocaleTimeString() : '-'}; last successful per-leg reconcile`}>
+                      {o.last_reconcile_ms ? new Date(o.last_reconcile_ms).toLocaleTimeString() : '-'}
+                    </span>
+                    {o.sl_guarantee_due_ms && (
+                      <span className="ltp" style={{ marginLeft: 6 }}
+                        title="SL guarantee deadline (accepted entry must be protected)">
+                        SL due {new Date(o.sl_guarantee_due_ms).toLocaleTimeString()}
+                      </span>
+                    )}
+                  </td>
+                  <td className="ltp">{fmtLat(o.fill_latency_ms) ?? '—'}</td>
+                </tr>
+              )
+            })}
           </tbody></table>
         )}
       </div>

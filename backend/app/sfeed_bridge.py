@@ -60,6 +60,9 @@ def map_order_data(d) -> dict:
         "prc": str(getattr(d, "average_price", "0")),
         "fldQty": getattr(d, "filled_quantity", 0),
         "rejRsn": str(getattr(d, "reject_reason", None) or getattr(d, "rejRsn", None) or "--"),
+        "guiOrdId": str(getattr(d, "gui_order_id", None)
+                        or getattr(d, "GuiOrdId", None)
+                        or getattr(d, "tag", None) or ""),
         "t_feed_ms": int(time.time() * 1000),
     }
 
@@ -93,6 +96,10 @@ def map_book_entry(d: dict) -> dict | None:
         "prc": str(g("avgPrc", "average_price", "avgPrc", "prc", "price", default="0")),
         "fldQty": g("fldQty", "filled_quantity", default=0),
         "rejRsn": str(g("rejRsn", "reject_reason", default="--")),
+        # Client tag echoed by Kotak as GuiOrdId. The engine uses it to adopt a
+        # market exit whose placement response timed out (Plan 06 M1) instead of
+        # firing a second exit.
+        "guiOrdId": str(g("GuiOrdId", "guiOrdId", "tag", default="")),
         "t_feed_ms": int(time.time() * 1000),
     }
 
@@ -148,6 +155,11 @@ class SFeedBridge:
         self._reconcile_state_lock = threading.Lock()
         self._reconcile_queued = 0
         self._reconcile_pending_force = False
+        self._last_positions_ok = False
+        self._poll_lock = threading.Lock()
+        self._poll_timer: threading.Timer | None = None
+        self._poll_due_ms: int | None = None
+        self._poll_generation = 0
 
     # ---------- lifecycle ----------
     def start(self):
@@ -171,6 +183,7 @@ class SFeedBridge:
         self._last_reconcile_error = None
         self._last_reconcile_error_ms = None
         self._last_reconcile_summary = {}
+        self._last_positions_ok = False
         self._order_connected = False
         self._watchdog_reconnects = 0
         self._quiet_warned = False
@@ -185,6 +198,12 @@ class SFeedBridge:
 
     def stop(self):
         self._stop.set()
+        with self._poll_lock:
+            timer, self._poll_timer = self._poll_timer, None
+            self._poll_due_ms = None
+            self._poll_generation += 1
+        if timer:
+            timer.cancel()
         with self._lock:
             self._subscribed.clear()  # next session resubscribes the full set
         sched, self._scheduler_thread = self._scheduler_thread, None
@@ -231,6 +250,55 @@ class SFeedBridge:
             log.warning("reconcile (%s) not queued: worker unavailable", source)
         return ok
 
+    def request_exit_poll(self, delay_sec: float = 0.0) -> bool:
+        """Queue one exit follow-up reconcile, optionally after a delay.
+
+        At most one timer is pending; a sooner deadline replaces a later one
+        and an immediate request cancels the timer. This keeps the worker free
+        while still following up inside a broker-call timeout window.
+        """
+        if self._stop.is_set():
+            return False
+        try:
+            delay = max(0.0, float(delay_sec))
+        except (TypeError, ValueError):
+            delay = 0.0
+        if delay <= 0:
+            with self._poll_lock:
+                timer, self._poll_timer = self._poll_timer, None
+                self._poll_due_ms = None
+                self._poll_generation += 1
+            if timer:
+                timer.cancel()
+            return self._schedule_reconcile("exit-poll", force=True)
+        due = _now_ms() + int(delay * 1000)
+        with self._poll_lock:
+            if self._stop.is_set():
+                return False
+            if self._poll_timer and self._poll_due_ms is not None \
+                    and self._poll_due_ms <= due:
+                return False
+            old, self._poll_timer = self._poll_timer, None
+            if old:
+                old.cancel()
+            self._poll_generation += 1
+            generation = self._poll_generation
+            self._poll_due_ms = due
+            timer = threading.Timer(delay, self._fire_exit_poll, args=(generation,))
+            timer.daemon = True
+            self._poll_timer = timer
+            timer.start()
+        return True
+
+    def _fire_exit_poll(self, generation: int):
+        with self._poll_lock:
+            if (generation != self._poll_generation
+                    or self._poll_timer is None or self._stop.is_set()):
+                return
+            self._poll_timer = None
+            self._poll_due_ms = None
+        self._schedule_reconcile("exit-poll", force=True)
+
     def _run_reconcile(self, source: str):
         """Runs on the worker: broker fetch + engine mutation, serialized."""
         try:
@@ -244,9 +312,22 @@ class SFeedBridge:
                 self._last_reconcile_error = "order_book_unavailable"
                 self._last_reconcile_error_ms = _now_ms()
                 log.warning("reconcile (%s) skipped: order book unavailable", source)
+                note = getattr(self.engine, "note_book_unavailable", None)
+                if note:
+                    try:
+                        note()
+                    except Exception as e:  # noqa: BLE001
+                        log.error("book-unavailable accounting failed: %s", e)
                 return
             try:
-                summary = self.engine.reconcile(book, positions)
+                try:
+                    summary = self.engine.reconcile(
+                        book, positions, positions_ok=self._last_positions_ok)
+                except TypeError as e:
+                    if "positions_ok" not in str(e):
+                        raise
+                    # Older/custom engine doubles only accept (book, positions).
+                    summary = self.engine.reconcile(book, positions)
             except Exception as e:  # noqa: BLE001
                 self._last_reconcile_error = f"apply:{type(e).__name__}"
                 self._last_reconcile_error_ms = _now_ms()
@@ -265,12 +346,23 @@ class SFeedBridge:
         finally:
             rerun = False
             with self._reconcile_state_lock:
-                self._reconcile_queued = 0
                 if self._reconcile_pending_force and not self._stop.is_set():
+                    # Keep the queued flag set while resubmitting so another
+                    # thread cannot slip a second reconcile into the same slot.
                     self._reconcile_pending_force = False
+                    self._reconcile_queued = 1
                     rerun = True
+                else:
+                    self._reconcile_queued = 0
             if rerun:
-                self._schedule_reconcile("forced", force=True)
+                ok = self.worker.submit(
+                    self._run_reconcile, "forced", critical=True,
+                    label="reconcile:forced", allow_inline=False)
+                if not ok:
+                    with self._reconcile_state_lock:
+                        self._reconcile_queued = 0
+                        self._reconcile_pending_force = False
+                    log.warning("forced reconcile not queued: worker unavailable")
 
     # ---------- health ----------
     def health(self) -> dict:
@@ -402,7 +494,10 @@ class SFeedBridge:
                         continue
                     self._last_tick_ms = _now_ms()
                     self.hub.latest[tick["tk"]] = tick
-                    self.worker.submit(self._apply_tick, tick, label="on_tick")
+                    if not self.worker.submit(self._apply_tick, tick,
+                                              label="on_tick",
+                                              allow_inline=False):
+                        log.debug("tick dropped: worker unavailable")
                     self._push({"kind": "tick", "tick": tick})
             finally:
                 self._ws = None
@@ -491,12 +586,13 @@ class SFeedBridge:
             self._quiet_warned = False
             self._handle_orderfeed_message(msg)
 
-    def _fetch_book_positions(self):
-        """Return (book, positions, book_ok).
+    def fetch_book(self):
+        """Return (mapped_book, ok) for reconcile + cancel confirmation.
 
-        `book_ok=False` means the order book could not be read authoritatively
-        (exception/timeout/unexpected shape). The caller must skip reconcile:
-        an empty list here is not the same as "no live orders".
+        `ok=False` means the order book could not be read authoritatively
+        (exception/timeout/unexpected shape). The caller must not treat an
+        empty list here as "no live orders". Runs on the command worker in
+        production, so cancel confirmation never blocks the feed loop.
         """
         book_rows = []
         book_ok = False
@@ -521,11 +617,28 @@ class SFeedBridge:
         except Exception as e:
             log.error("reconcile order_book failed: %s", e)
         book = [m for m in (map_book_entry(r) for r in book_rows) if m]
+        return book, book_ok
+
+    def _fetch_book_positions(self):
+        """Return (book, positions, book_ok).
+
+        `_last_positions_ok` distinguishes a successful empty positions
+        snapshot (flat account) from a failed fetch. The engine must not
+        auto-replace an SL without a fresh authoritative positions snapshot
+        (Plan 06 H3).
+        """
+        book, book_ok = self.fetch_book()
         try:
-            positions = self.kotak.positions() or {}
+            try:
+                positions = self.kotak.positions(strict=True) or {}
+            except TypeError:
+                # Older/custom broker doubles only accept positions().
+                positions = self.kotak.positions() or {}
+            self._last_positions_ok = True
         except Exception as e:
             log.error("reconcile positions failed: %s", e)
             positions = {}
+            self._last_positions_ok = False
         return book, positions, book_ok
 
     async def _subscribe_wanted(self, ws, extra=None):
@@ -565,8 +678,12 @@ class SFeedBridge:
         if name == "OrderUpdate" and data is not None:
             od = map_order_data(data)
             if od.get("nOrdNo"):
-                self.worker.submit(self._apply_order_update, od,
-                                   critical=True, label="on_order_update")
+                if not self.worker.submit(self._apply_order_update, od,
+                                          critical=True,
+                                          label="on_order_update",
+                                          allow_inline=False):
+                    log.critical("ORDER UPDATE DROPPED %s: worker unavailable",
+                                 od.get("nOrdNo"))
                 self._push({"kind": "order", "order": od})
         elif name == "PositionUpdate" and data is not None:
             d = data.__dict__ if hasattr(data, "__dict__") else {}

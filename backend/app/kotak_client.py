@@ -242,7 +242,8 @@ class KotakService:
         )
 
     def place_stop_loss(self, exchange_segment: str, quantity: str, trading_symbol: str,
-                          trigger_price: str, transaction_type: str = "S", product: str = "MIS"):
+                          trigger_price: str, transaction_type: str = "S", product: str = "MIS",
+                          tag: str | None = None):
         """Protective SL opposite to the entry side.
 
         Long entry (B) -> SELL SL with limit just under trigger.
@@ -260,7 +261,7 @@ class KotakService:
                                 order_type="SL", quantity=quantity, trading_symbol=trading_symbol,
                                 transaction_type=transaction_type,
                                 trigger_price=f"{trig:.2f}",
-                                price=f"{limit:.2f}")
+                                price=f"{limit:.2f}", tag=tag)
 
     @staticmethod
     def sl_limit_price(trigger: float, transaction_type: str = "S") -> float:
@@ -272,13 +273,15 @@ class KotakService:
         return round(max(0.05, trig - offset), 2)
 
     def place_market_exit(self, exchange_segment: str, quantity: str, trading_symbol: str,
-                          transaction_type: str = "S", product: str = "MIS"):
+                          transaction_type: str = "S", product: str = "MIS",
+                          tag: str | None = None):
         # MKT legs must carry price "0" — an empty string is rejected by OMS
         # (this silently killed every synthetic target-exit and Exit-button
         # flatten: order accepted then never fills / rejected downstream).
         return self.place_order(exchange_segment=exchange_segment, product=product,
                                 order_type="MKT", price="0", quantity=quantity,
-                                trading_symbol=trading_symbol, transaction_type=transaction_type)
+                                trading_symbol=trading_symbol,
+                                transaction_type=transaction_type, tag=tag)
 
     def modify_sl(self, order_id: str, quantity: str, new_trigger: str,
                   transaction_type: str = "S"):
@@ -406,13 +409,25 @@ class KotakService:
         return None
 
     # ---------- positions (same aggregation as TransTrader.get_positions) ----------
-    def positions(self) -> dict:
+    def positions(self, strict: bool = False) -> dict:
+        """Aggregate net positions.
+
+        `strict=True` is used by reconcile: a failed/malformed response must
+        raise instead of looking like a flat account (Plan 06 H3), otherwise a
+        transient broker error could be mistaken for an external/square-off.
+        """
         try:
             raw = self._require().positions()
         except Exception as e:
             log.error("positions call failed: %s", e)
+            if strict:
+                raise
             return {}
-        if not isinstance(raw, dict) or raw.get("stCode") != 200 or not raw.get("data"):
+        if not isinstance(raw, dict) or raw.get("stCode") != 200:
+            if strict:
+                raise RuntimeError(f"positions failed: {str(raw)[:200]}")
+            return {}
+        if not raw.get("data"):
             return {}
         df = pd.DataFrame(raw["data"])
         num_cols = ["cfBuyQty", "flBuyQty", "cfSellQty", "flSellQty", "cfBuyAmt", "buyAmt",

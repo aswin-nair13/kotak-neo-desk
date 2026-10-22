@@ -5,12 +5,13 @@ import threading
 import time
 
 from fastapi import APIRouter, Depends, HTTPException
+from fastapi.responses import JSONResponse
 
 from ..auth import require_user
 from ..broker_worker import WorkerQueueFull
 from ..config import settings
 from ..kotak_client import KotakService
-from ..schemas import ExitBody, SingleOrderBody, StraddleBody
+from ..schemas import ExitBody, ForceExitBody, SingleOrderBody, StraddleBody
 from ..synthetic_engine import SyntheticEngine
 from ..ws_manager import Hub
 
@@ -363,6 +364,44 @@ def _exit_position_impl(body: ExitBody):
             "cancelled": cancelled, "closed_legs": len(legs), "exit_order": r,
             "timing": {"server_recv_ms": t_recv, "broker_rtt_ms": t_b1 - t_b0,
                        "server_total_ms": _ms() - t_recv, "placed_at_ms": t_b1}}
+
+
+@router.post("/force-exit")
+def force_exit(body: ForceExitBody, user: str = Depends(require_user)):
+    """Audited operator escape hatch for a blocked (EXIT_BLOCKED_SL_STILL_WORKING)
+    or naked/ERRORED leg. Still cancels + confirms the SL before one market exit;
+    it never bypasses the no-exit-while-SL-working invariant.
+    """
+    assert engine is not None
+    syn = engine.by_any_id(body.entry_order_id)
+    if syn is None:
+        raise HTTPException(status_code=404,
+                            detail=f"No synthetic leg for {body.entry_order_id}")
+    log.warning("AUDIT force_exit requested user=%s entry=%s symbol=%s reason=%s",
+                user, body.entry_order_id, syn.get("trading_symbol"), body.reason)
+    result = _run_on_worker(_force_exit_impl, body, user,
+                            label=f"force_exit:{body.entry_order_id}")
+    return result
+
+
+def _force_exit_impl(body: ForceExitBody, user: str):
+    assert engine is not None
+    res = engine.force_exit(body.entry_order_id, user, body.reason)
+    if res is None:
+        raise HTTPException(status_code=404,
+                            detail=f"No synthetic leg for {body.entry_order_id}")
+    outcome = res.get("force_exit_result")
+    # Pending is not success: the operator must see 409 unless the broker
+    # cancel/exit is actually confirmed.
+    ok = outcome in ("closed", "exit_placed", "sl_hit")
+    payload = {"ok": ok, "result": outcome, "leg": res}
+    if not ok:
+        log.error("AUDIT force_exit BLOCKED user=%s entry=%s result=%s",
+                  user, body.entry_order_id, outcome)
+        return JSONResponse(status_code=409, content=payload)
+    log.warning("AUDIT force_exit done user=%s entry=%s exit=%s result=%s",
+                user, body.entry_order_id, res.get("exit_order_id"), outcome)
+    return payload
 
 
 @router.post("/modify-sl/{order_id}", dependencies=[Depends(require_user)])

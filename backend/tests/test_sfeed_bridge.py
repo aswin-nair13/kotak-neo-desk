@@ -91,11 +91,28 @@ def test_handle_orderupdate_feeds_engine():
     b = _bridge()
     pushed = []
     b._push = pushed.append
-    b._handle_orderfeed_message(OrderUpdate(OrderData(
-        order_id="7", order_status="complete", trading_symbol="X",
-        transaction_type="S", quantity=1, average_price="5")))
+    b.worker.start()
+    try:
+        b._handle_orderfeed_message(OrderUpdate(OrderData(
+            order_id="7", order_status="complete", trading_symbol="X",
+            transaction_type="S", quantity=1, average_price="5")))
+        for _ in range(100):
+            if b.engine.on_order_update.called:
+                break
+            time.sleep(0.01)
+    finally:
+        b.stop()
     b.engine.on_order_update.assert_called_once()
     assert pushed and pushed[0]["kind"] == "order"
+
+
+def test_handle_orderupdate_drops_when_worker_unavailable():
+    b = _bridge()
+    b._push = lambda _m: None
+    b._handle_orderfeed_message(OrderUpdate(OrderData(
+        order_id="8", order_status="complete", trading_symbol="X",
+        transaction_type="S", quantity=1, average_price="5")))
+    b.engine.on_order_update.assert_not_called()
 
 
 # ---------- Plan 03: decoupled supervisors ----------
@@ -209,15 +226,86 @@ def test_reconcile_marks_naked_when_sl_missing_or_dead(monkeypatch):
     broker = MagicMock()
     eng = SyntheticEngine(broker=broker)
     eng.add(_pending_leg("E1", status="ACTIVE", sl_order_id="SL9"))
-    eng.reconcile([], {})  # one empty/lagging frame is not proof
+    pos = {"X": {"qty": 20}}
+    eng.reconcile([], pos)  # one empty/lagging frame is not proof
     assert eng.orders["E1"]["status"] == "ACTIVE"
     assert eng.orders["E1"]["sl_missing_streak"] == 1
     time.sleep(0.06)
-    eng.reconcile([], {})
+    eng.reconcile([], pos)
     assert eng.orders["E1"]["status"] == "ERRORED"
     assert "missing" in eng.orders["E1"]["error"]
 
     eng.add(_pending_leg("E2", status="ACTIVE", sl_order_id="SL8"))
-    eng.reconcile([{"nOrdNo": "SL8", "ordSt": "cancelled", "trdSym": "X"}], {})
+    eng.reconcile([{"nOrdNo": "SL8", "ordSt": "cancelled", "trdSym": "X"}], pos)
     assert eng.orders["E2"]["status"] == "ERRORED"
     assert "unprotected" in eng.orders["E2"]["error"]
+
+
+def test_bridge_accounts_for_unavailable_book(monkeypatch):
+    b = _bridge()
+    monkeypatch.setattr(b, "_fetch_book_positions", lambda: ([], {}, False))
+    b._run_reconcile("test")
+    b.engine.note_book_unavailable.assert_called_once()
+    assert b._last_reconcile_error == "order_book_unavailable"
+
+
+def test_positions_failure_is_not_authoritative_flat():
+    b = _bridge()
+    b.kotak.order_book.return_value = {"data": []}
+    b.kotak.positions.side_effect = RuntimeError("positions timeout")
+    book, positions, ok = b._fetch_book_positions()
+    assert ok is True and book == []       # book itself was authoritative
+    assert positions == {}
+    assert b._last_positions_ok is False
+
+
+def test_empty_positions_success_is_authoritative_flat():
+    b = _bridge()
+    b.kotak.order_book.return_value = {"data": []}
+    b.kotak.positions.return_value = {}
+    _, positions, ok = b._fetch_book_positions()
+    assert ok is True and positions == {}
+    assert b._last_positions_ok is True
+
+
+def test_delayed_exit_poll_coalesces_and_stop_cancels():
+    b = _bridge()
+    calls = []
+    b._schedule_reconcile = lambda source, force=False: (
+        calls.append(source) or True)
+
+    assert b.request_exit_poll(0.05) is True
+    timer = b._poll_timer
+    assert timer is not None
+    assert b.request_exit_poll(0.05) is False   # one timer, same deadline
+    assert b._poll_timer is timer                # not replaced/duplicated
+    time.sleep(0.12)
+    assert calls == ["exit-poll"]
+    assert b._poll_timer is None
+
+    assert b.request_exit_poll(0.05) is True
+    b.stop()
+    time.sleep(0.12)
+    assert calls == ["exit-poll"]
+
+
+def test_forced_reconcile_resubmits_without_queue_gap(monkeypatch):
+    b = _bridge()
+    calls = []
+    monkeypatch.setattr(b, "_fetch_book_positions", lambda: ([], {}, True))
+    b.engine.reconcile.return_value = {"checked": 0}
+    b._reconcile_pending_force = True
+    b._reconcile_queued = 1
+
+    def submit(fn, *args, **kwargs):
+        calls.append((fn, args, kwargs))
+        # A second request arriving during resubmit must see the reserved slot.
+        assert b._schedule_reconcile("racer") is False
+        return True
+
+    b.worker.submit = submit
+    b._run_reconcile("periodic")
+    assert len(calls) == 1
+    assert calls[0][1] == ("forced",)
+    assert b._reconcile_queued == 1
+    assert b._reconcile_pending_force is False
