@@ -1,6 +1,7 @@
 from fastapi import APIRouter, Depends, HTTPException
 
 from ..auth import require_user
+from ..broker_worker import WorkerQueueFull
 from ..config import settings
 from ..kotak_client import KotakService
 from ..schemas import WatchBody
@@ -8,6 +9,7 @@ from ..schemas import WatchBody
 router = APIRouter()
 kotak: KotakService | None = None
 bridge = None  # SFeedBridge, wired in main.py
+read_worker = None  # dedicated CommandWorker for read-only broker calls
 
 
 def _step(instrument: str) -> int:
@@ -108,7 +110,17 @@ def batch_quotes(body: WatchBody):
 @router.get("/positions", dependencies=[Depends(require_user)])
 def positions():
     assert kotak is not None
-    return {"positions": kotak.positions()}
+    if read_worker is None:
+        return {"positions": kotak.positions()}
+    try:
+        data = read_worker.submit_wait(
+            kotak.positions, label="positions",
+            timeout=max(0.1, float(settings.orderbook_timeout_sec)))
+    except TimeoutError as e:
+        raise HTTPException(status_code=504, detail=f"Broker read timed out: {e}")
+    except WorkerQueueFull as e:
+        raise HTTPException(status_code=503, detail=f"Broker read queue full: {e}")
+    return {"positions": data}
 
 
 @router.post("/masters/refresh", dependencies=[Depends(require_user)])

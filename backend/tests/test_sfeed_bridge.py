@@ -13,6 +13,7 @@ from app.sfeed_bridge import (
     map_book_entry,
     map_feed_message,
     map_order_data,
+    parse_broker_time_ms,
 )
 from app.synthetic_engine import SyntheticEngine
 
@@ -162,6 +163,31 @@ def test_stop_cancels_both_supervisors():
 
 
 # ---------- Plan 03: reconcile ----------
+def test_ist_wallclock_update_is_parsed_as_ist_regardless_of_host():
+    """Kotak timestamps are IST wall clock with no offset; a UTC host must not
+    shift them (which would make every snapshot look stale)."""
+    from datetime import datetime, timedelta, timezone
+
+    ist = timezone(timedelta(hours=5, minutes=30))
+    expected = int(datetime(2025, 10, 2, 10, 15, 30,
+                            tzinfo=ist).timestamp() * 1000)
+    assert parse_broker_time_ms("2025-10-02 10:15:30") == expected
+
+    row = map_book_entry({"nOrdNo": "S1", "ordSt": "open",
+                          "hsUpTm": "2025-10-02 10:15:30",
+                          "ordDtTm": "2023-01-01 00:00:00"})
+    assert row["update_ts_source"] == "update"
+    assert row["update_ts_ms"] == expected
+
+
+def test_explicit_utc_offset_is_respected():
+    from datetime import UTC, datetime
+
+    expected = int(datetime(2025, 10, 2, 10, 15, 30,
+                            tzinfo=UTC).timestamp() * 1000)
+    assert parse_broker_time_ms("2025-10-02T10:15:30Z") == expected
+
+
 def test_map_book_entry_wire_abbrev():
     od = map_book_entry({"nOrdNo": "9", "ordSt": "complete", "trdSym": "X",
                          "trnsTp": "S", "qty": 20, "avgPrc": "12.5", "fldQty": 20})

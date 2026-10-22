@@ -40,8 +40,10 @@ BUILD = "sfeed-bridge"
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     hub.main_loop = asyncio.get_running_loop()
+    read_worker.start()
     yield
     bridge.stop()
+    read_worker.stop()
 
 
 kotak = KotakService(consumer_key=settings.kotak_consumer_key)
@@ -51,6 +53,14 @@ worker = CommandWorker(
     stall_ms=int(settings.broker_stall_log_sec * 1000),
     stop_timeout=settings.worker_stop_timeout_sec,
     call_timeout=settings.broker_call_timeout_sec)
+# Read-only UI calls bypass the mutation worker so a slow book/positions read
+# can never delay a queued cancel/exit. The SDK read itself is not cancellable;
+# the caller gets a timeout while the read thread finishes independently.
+read_worker = CommandWorker(
+    "broker-reader", max_queue=32,
+    stall_ms=int(settings.broker_stall_log_sec * 1000),
+    stop_timeout=settings.worker_stop_timeout_sec,
+    call_timeout=settings.orderbook_timeout_sec)
 hub = Hub()
 hub.set_engine(engine)
 bridge = SFeedBridge(hub=hub, engine=engine, kotak=kotak, worker=worker)
@@ -79,8 +89,10 @@ orders_routes.engine = engine
 orders_routes.hub = hub
 orders_routes.bridge = bridge
 orders_routes.worker = worker
+orders_routes.read_worker = read_worker
 market_routes.kotak = kotak
 market_routes.bridge = bridge
+market_routes.read_worker = read_worker
 
 app.include_router(auth_routes.router, prefix="/api/auth", tags=["auth"])
 app.include_router(orders_routes.router, prefix="/api/orders", tags=["orders"])
@@ -103,6 +115,9 @@ def health():
             "last_reconcile_ms": feed.get("last_reconcile_ms"),
             "last_reconcile_ok_ms": feed.get("last_reconcile_ok_ms"),
             "last_reconcile_error": feed.get("last_reconcile_error"),
+            "last_positions_ms": feed.get("last_positions_ms"),
+            "last_positions_ok": feed.get("last_positions_ok"),
+            "last_positions_error": feed.get("last_positions_error"),
             "feed": feed,
             "worker": w,
             "worker_queue_depth": w.get("queue_depth"),

@@ -55,6 +55,18 @@ class SyntheticEngine:
             d.setdefault("exit_state", None)
             d.setdefault("exit_ambiguous", False)
             d.setdefault("exit_unknown_streak", 0)
+            # Plan 06 WP5: where/when the tracker last agreed with broker state,
+            # and a manual modify window that suppresses automatic SL re-place.
+            d.setdefault("last_synced_ms", None)
+            d.setdefault("source", None)
+            d.setdefault("sl_modify_pending", False)
+            d.setdefault("sl_modify_target", None)
+            d.setdefault("sl_modify_deadline_ms", None)
+            d.setdefault("manual_sl_cancel", False)
+            d.setdefault("manual_sl_cancel_pending", False)
+            d.setdefault("manual_sl_cancel_deadline_ms", None)
+            d.setdefault("manual_sl_cancel_confirmed", False)
+            d.setdefault("cancel_requested_ids", {})
             self.orders[d["entry_order_id"]] = d
 
     def _by_any_id_locked(self, oid: str) -> dict | None:
@@ -108,6 +120,7 @@ class SyntheticEngine:
             for o in out:
                 o["status"] = "CLOSED"
                 o["exit_reason"] = reason
+                self._clear_pending_on_close(o)
             return [copy.deepcopy(o) for o in out]
 
     # -- order feed --
@@ -121,6 +134,319 @@ class SyntheticEngine:
             except (TypeError, ValueError):
                 continue
         return None
+
+    # -- manual / external sync (Plan 06 WP5) --
+    @staticmethod
+    def _num_or_none(v) -> float | None:
+        try:
+            f = float(v)
+        except (TypeError, ValueError):
+            return None
+        return f
+
+    @classmethod
+    def _trigger_price(cls, od: dict) -> float | None:
+        for k in ("trigger_price", "trgPrc", "triggerPrice", "trg_prc"):
+            v = od.get(k)
+            if v in (None, ""):
+                continue
+            f = cls._num_or_none(v)
+            if f is not None and f > 0:
+                return f
+        return None
+
+    @classmethod
+    def _order_qty(cls, od: dict) -> float | None:
+        for k in ("qty", "quantity", "brdLtQty"):
+            f = cls._num_or_none(od.get(k))
+            if f is not None and f > 0:
+                return f
+        return None
+
+    @staticmethod
+    def _row_version_ms(od: dict) -> tuple[int | None, str | None]:
+        """(epoch_ms, source) for a mapped row's version field.
+
+        `update_ts_ms` is set by `sfeed_bridge` from the broker's update time
+        (updRecvTm/hsUpTm); `update_ts_source == "created"` means only the order
+        creation time was available, which must never gate a modification.
+        """
+        if not isinstance(od, dict):
+            return None, None
+        raw = od.get("update_ts_ms")
+        src = od.get("update_ts_source")
+        if raw in (None, ""):
+            return None, src
+        try:
+            f = float(raw)
+        except (TypeError, ValueError):
+            return None, src
+        a = abs(f)
+        if a >= 1e17:
+            ms = int(f / 1e6)
+        elif a >= 1e14:
+            ms = int(f / 1e3)
+        elif a >= 1e11:
+            ms = int(f)
+        else:
+            ms = int(f * 1000)
+        return ms, src
+
+    def _sync_sl_from_order(self, syn: dict, od: dict, source: str):
+        """Adopt the broker's current SL trigger/qty (feed or book wins).
+
+        A manual broker-app modify changes the exchange order, not our tracker;
+        without this the UI keeps showing the old stop and a repair would
+        re-place it at that stale level. Returns True when the tracker changed.
+        """
+        if not isinstance(od, dict):
+            return False
+        # A book snapshot taken before our last accepted sync/modify must never
+        # revert the trigger (Plan 06 WP5 stale-echo guard).
+        if source == "reconcile":
+            ts, ts_src = self._row_version_ms(od)
+            marks = [self._num_or_none(syn.get("last_synced_ms")),
+                     self._num_or_none(syn.get("sl_modify_started_ms"))]
+            last = max((m for m in marks if m is not None), default=None)
+            if ts is None or ts_src == "created":
+                # No authoritative update timestamp: never silently drop a
+                # legitimate row (a creation time is not a version). Adopt it.
+                log.info("SL SYNC version unknown/creation-only %s entry=%s "
+                         "sl=%s (source=%s) - adopting conservatively",
+                         syn.get("trading_symbol"), syn.get("entry_order_id"),
+                         syn.get("sl_order_id"), ts_src)
+            elif last is not None and ts < int(last):
+                log.info("SL SYNC IGNORED stale book echo %s entry=%s sl=%s "
+                         "(update_ts=%s < last_synced=%s)",
+                         syn.get("trading_symbol"), syn.get("entry_order_id"),
+                         syn.get("sl_order_id"), ts, int(last))
+                return False
+        trig = self._trigger_price(od)
+        qty = self._order_qty(od)
+        now = int(time.time() * 1000)
+        changed = False
+        pending_cleared = False
+        app_echo = False
+        with self._lock:
+            manual_target = (self._num_or_none(syn.get("sl_modify_target"))
+                             if syn.get("sl_modify_pending") else None)
+            auto_target = self._num_or_none(syn.get("sl_app_modify_target"))
+            expected = manual_target if manual_target is not None else auto_target
+            if trig is not None:
+                old = self._num_or_none(syn.get("stop_loss_price"))
+                if old is None or abs(old - trig) > 1e-9:
+                    syn["stop_loss_price"] = f"{trig:.2f}"
+                    matched = (expected is not None
+                               and abs(expected - trig) <= 1e-9)
+                    syn["stop_loss_source"] = "app" if matched else "external"
+                    changed = True
+                    app_echo = matched
+                    if matched and auto_target is not None:
+                        syn.pop("sl_app_modify_target", None)
+                elif auto_target is not None and \
+                        abs(auto_target - trig) <= 1e-9:
+                    # `_trail` already updated the tracker trigger; the feed
+                    # echo still proves our own modify landed.
+                    syn.pop("sl_app_modify_target", None)
+                    app_echo = True
+            if qty is not None:
+                old_q = self._num_or_none(syn.get("sl_quantity"))
+                if old_q is None or abs(old_q - qty) > 1e-9:
+                    syn["sl_quantity"] = qty
+                    changed = True
+            if syn.get("sl_modify_pending"):
+                target = self._num_or_none(syn.get("sl_modify_target"))
+                deadline = self._num_or_none(syn.get("sl_modify_deadline_ms"))
+                if target is not None and trig is not None \
+                        and abs(target - trig) <= 1e-9:
+                    syn["sl_modify_pending"] = False
+                    syn["sl_modify_settled_ms"] = now
+                    pending_cleared = True
+                elif changed and not app_echo:
+                    # Broker state moved (another modify / fill resize): adopt it
+                    # and stop suppressing repairs.
+                    syn["sl_modify_pending"] = False
+                    syn["sl_modify_settled_ms"] = now
+                    pending_cleared = True
+                elif deadline is not None and now >= deadline:
+                    syn["sl_modify_pending"] = False
+                    syn["sl_modify_expired_ms"] = now
+                    pending_cleared = True
+                    log.warning("SL MODIFY PENDING EXPIRED %s entry=%s "
+                                "(target=%s) — adopting broker state",
+                                syn.get("trading_symbol"),
+                                syn.get("entry_order_id"),
+                                syn.get("sl_modify_target"))
+            if syn.get("manual_sl_cancel_pending"):
+                deadline = self._num_or_none(
+                    syn.get("manual_sl_cancel_deadline_ms"))
+                if deadline is not None and now >= deadline:
+                    # Cancel did not land before the deadline. Keep the manual
+                    # intent (never auto-re-place), but allow an explicit retry.
+                    syn["manual_sl_cancel_pending"] = False
+                    syn["manual_sl_cancel_deadline_ms"] = None
+                    syn["manual_sl_cancel_still_working_ms"] = now
+                    log.error("MANUAL SL CANCEL NOT APPLIED %s entry=%s sl=%s: "
+                              "SL still working after %.1fs — no automatic "
+                              "re-place; operator may retry cancel",
+                              syn.get("trading_symbol"),
+                              syn.get("entry_order_id"),
+                              syn.get("sl_order_id"),
+                              float(settings.sl_cancel_timeout_sec))
+            syn["last_synced_ms"] = now
+            # Latest actual source; only a value our app did not request is
+            # attributed to an external (broker-app) change.
+            syn["source"] = source if (not changed or app_echo) else "external"
+        if changed:
+            log.warning("SL SYNC %s entry=%s sl=%s trigger=%s qty=%s source=%s",
+                        syn.get("trading_symbol"), syn.get("entry_order_id"),
+                        syn.get("sl_order_id"), syn.get("stop_loss_price"),
+                        syn.get("sl_quantity"), syn.get("source"))
+        elif pending_cleared:
+            log.info("SL MODIFY SETTLED %s entry=%s sl=%s",
+                     syn.get("trading_symbol"), syn.get("entry_order_id"),
+                     syn.get("sl_order_id"))
+        return changed
+
+    def _sl_modify_active(self, syn: dict) -> bool:
+        """True while an operator/API SL modify is in flight (do not re-place)."""
+        with self._lock:
+            if not syn.get("sl_modify_pending"):
+                return False
+            deadline = self._num_or_none(syn.get("sl_modify_deadline_ms"))
+            now = int(time.time() * 1000)
+            if deadline is not None and now >= deadline:
+                syn["sl_modify_pending"] = False
+                syn["sl_modify_expired_ms"] = now
+                log.warning("SL MODIFY TIMEOUT %s entry=%s target=%s — pending "
+                            "cleared; broker/book state wins",
+                            syn.get("trading_symbol"),
+                            syn.get("entry_order_id"),
+                            syn.get("sl_modify_target"))
+                return False
+            return True
+
+    def begin_sl_modify(self, order_id: str, target, timeout_sec: float | None = None) -> bool:
+        """Mark a manual SL modify in flight before the broker call."""
+        f = self._num_or_none(target)
+        if f is None or f <= 0:
+            return False
+        now = int(time.time() * 1000)
+        timeout = (settings.sl_modify_timeout_sec if timeout_sec is None
+                   else timeout_sec)
+        with self._lock:
+            syn = self._by_any_id_locked(str(order_id))
+            if syn is None:
+                return False
+            syn["sl_modify_pending"] = True
+            syn["sl_modify_target"] = f"{f:.2f}"
+            syn["sl_modify_started_ms"] = now
+            syn["sl_modify_deadline_ms"] = now + int(max(0.1, float(timeout)) * 1000)
+        return True
+
+    def finish_sl_modify(self, order_id: str, ok: bool, error: str | None = None):
+        """Broker response for a manual modify.
+
+        Success keeps the pending window open until the feed/book echoes the new
+        trigger (book wins). Failure clears it and raises an explicit alert —
+        the tracker is never silently reverted.
+        """
+        now = int(time.time() * 1000)
+        with self._lock:
+            syn = self._by_any_id_locked(str(order_id))
+            if syn is None:
+                return
+            if ok:
+                if syn.get("sl_modify_pending"):
+                    syn["sl_modify_ack_ms"] = now
+                return
+            syn["sl_modify_pending"] = False
+            syn["sl_modify_deadline_ms"] = None
+            syn["sl_modify_failed_ms"] = now
+            syn["sl_modify_error"] = str(error or "")[:200]
+        log.error("SL MODIFY FAILED %s entry=%s order=%s: %s — pending cleared, "
+                  "tracker NOT reverted", syn.get("trading_symbol"),
+                  syn.get("entry_order_id"), order_id, error)
+
+    def manual_cancel_requested(self, order_id: str) -> bool:
+        """True while a double-click must be suppressed (or cancel is confirmed).
+
+        After a timed-out SL cancel that did not land, the intent stays but a
+        retry is allowed (the operator explicitly asks again).
+        """
+        oid = str(order_id)
+        now = int(time.time() * 1000)
+        with self._lock:
+            syn = self._by_any_id_locked(oid)
+            if syn is not None and oid == str(syn.get("sl_order_id") or ""):
+                if syn.get("manual_sl_cancel_confirmed"):
+                    return True
+                if syn.get("manual_sl_cancel_pending"):
+                    deadline = self._num_or_none(
+                        syn.get("manual_sl_cancel_deadline_ms"))
+                    return bool(deadline is None or now < deadline)
+                # Timed out without landing: allow the operator to retry.
+                return False
+            for o in self.orders.values():
+                if oid in (o.get("cancel_requested_ids") or {}):
+                    return True
+        return False
+
+    def note_manual_cancel(self, order_id: str, ok: bool,
+                           error: str | None = None) -> dict | None:
+        """Record operator cancel intent *before* trusting the broker response.
+
+        A timeout can happen after the broker actually cancelled, so the intent
+        and deadline are recorded regardless of `ok`. Reconcile then treats a
+        missing SL as intentionally cancelled and never auto-re-places it.
+        """
+        now = int(time.time() * 1000)
+        timeout = max(0.1, float(settings.sl_cancel_timeout_sec))
+        with self._lock:
+            syn = self._by_any_id_locked(str(order_id))
+            if syn is None:
+                return None
+            status = syn.get("status")
+            is_sl = str(order_id) == str(syn.get("sl_order_id") or "")
+            # Unrelated/terminal orders (exit/entry ids, CLOSED legs) must never
+            # be converted into a manual SL-cancel intent.
+            live_sl = (is_sl and status in ("ACTIVE", "TRAILING", "ERRORED")
+                       and not syn.get("manual_sl_cancel_confirmed"))
+            if live_sl:
+                syn["sl_cancel_requested_ms"] = now
+                syn["manual_sl_cancel"] = True
+                syn["manual_sl_cancel_ms"] = now
+                syn["manual_sl_cancel_pending"] = True
+                syn["manual_sl_cancel_deadline_ms"] = now + int(timeout * 1000)
+                syn["sl_modify_pending"] = False
+                syn["sl_modify_deadline_ms"] = None
+            if ok:
+                ids = syn.setdefault("cancel_requested_ids", {})
+                ids[str(order_id)] = now
+                syn["manual_cancel_requested_ms"] = now
+                syn["last_synced_ms"] = now
+                # App-initiated action; "external" stays for broker-app changes.
+                syn["source"] = "app"
+                if str(order_id) == str(syn.get("entry_order_id")) \
+                        and status in ("PENDING_ENTRY", "ACTIVE", "TRAILING",
+                                       "CLOSING"):
+                    # Refresh on every accepted entry cancel; a partial-fill
+                    # ACTIVE entry can still have a working remainder.
+                    syn["entry_cancel_sent_ms"] = now
+                    if status == "PENDING_ENTRY":
+                        syn["entry_cancel_pending"] = False
+            else:
+                syn["manual_cancel_error"] = str(error or "")[:200]
+                syn["manual_cancel_error_ms"] = now
+            out = copy.deepcopy(syn)
+        if ok:
+            log.warning("MANUAL CANCEL %s order=%s symbol=%s",
+                        order_id, order_id, out.get("trading_symbol"))
+        else:
+            log.error("MANUAL CANCEL FAILED order=%s symbol=%s: %s "
+                      "(intent retained until confirm/deadline)", order_id,
+                      out.get("trading_symbol"), error)
+        return out
 
     @staticmethod
     def _fill_qty(od: dict) -> float | None:
@@ -141,10 +467,10 @@ class SyntheticEngine:
                 return f
         return None
 
-    def on_order_update(self, od: dict):
+    def on_order_update(self, od: dict, source: str = "feed"):
         """Apply one order frame; broker I/O happens outside `_lock`."""
         with self._lock:
-            action = self._on_order_update_locked(od)
+            action = self._on_order_update_locked(od, source=source)
         if action is None:
             return
         kind, syn, payload = action
@@ -179,6 +505,14 @@ class SyntheticEngine:
         return not (cls._is_complete(st) or cls._is_reject(st)
                     or cls._is_cancel(st))
 
+    @staticmethod
+    def _clear_pending_on_close(syn: dict):
+        """No modify/cancel window survives a CLOSED transition."""
+        syn["sl_modify_pending"] = False
+        syn["sl_modify_deadline_ms"] = None
+        syn["manual_sl_cancel_pending"] = False
+        syn["manual_sl_cancel_deadline_ms"] = None
+
     def _mark_naked(self, syn: dict, reason: str, error: str):
         """ERRORED + explicit naked-position alert (log ERROR + API state)."""
         with self._lock:
@@ -191,7 +525,7 @@ class SyntheticEngine:
                   syn.get("trading_symbol"), syn.get("entry_order_id"),
                   syn.get("sl_order_id"), error)
 
-    def _on_order_update_locked(self, od: dict):
+    def _on_order_update_locked(self, od: dict, source: str = "feed"):
         oid = od.get("nOrdNo")
         status = str(od.get("ordSt", "")).lower()
         syn = self._by_any_id_locked(oid)
@@ -255,6 +589,36 @@ class SyntheticEngine:
         t_now = int(time.time() * 1000)
         log.info("synthetic %s: %s -> %s (%s)", syn["trading_symbol"], oid, status, syn["status"])
 
+        # Plan 06 WP5: adopt a working SL's current trigger/qty from the source.
+        if oid == syn.get("sl_order_id") and self._is_open(status):
+            self._sync_sl_from_order(syn, od, source)
+        else:
+            with self._lock:
+                syn["last_synced_ms"] = t_now
+                syn["source"] = source
+
+        if (oid == syn.get("sl_order_id") and self._is_cancel(status)
+                and syn.get("manual_sl_cancel")
+                and syn.get("status") in ("ACTIVE", "TRAILING", "ERRORED")):
+            # Operator cancelled the protective SL from the Orders panel. Do not
+            # silently re-place it; make the naked position explicit instead.
+            with self._lock:
+                syn["status"] = "ERRORED"
+                syn["blocked_reason"] = "SL_CANCELLED_MANUAL"
+                syn["error"] = f"SL {oid} cancelled manually — position is naked"
+                syn["naked_position"] = True
+                syn["exit_pending"] = False
+                syn["exit_state"] = "BLOCKED"
+                syn["manual_sl_cancel_pending"] = False
+                syn["manual_sl_cancel_deadline_ms"] = None
+                syn["manual_sl_cancel_confirmed"] = True
+                syn["last_synced_ms"] = t_now
+                syn["source"] = "external"
+            log.error("SL MANUALLY CANCELLED %s entry=%s sl=%s — NAKED POSITION "
+                      "(automatic re-place suppressed)", syn.get("trading_symbol"),
+                      syn.get("entry_order_id"), oid)
+            return None
+
         entry_complete_ok = (
             syn["status"] in ("PENDING_ENTRY", "ACTIVE", "TRAILING")
             or (syn["status"] == "ERRORED" and not syn.get("sl_placed")
@@ -300,6 +664,7 @@ class SyntheticEngine:
                 return ("place_sl", syn, od)
             syn["status"] = "CLOSED"
             syn["exit_reason"] = "ENTRY_" + status.upper()
+            self._clear_pending_on_close(syn)
 
         elif oid == syn.get("sl_order_id") and self._is_complete(status) \
                 and syn["status"] != "CLOSED":
@@ -314,6 +679,7 @@ class SyntheticEngine:
             syn["blocked_reason"] = None
             syn["exit_pending"] = False
             syn["exit_state"] = None
+            self._clear_pending_on_close(syn)
             log.info("SL HIT %s entry=%s sl=%s", syn["trading_symbol"],
                      syn.get("entry_order_id"), oid)
             if late_exit:
@@ -356,6 +722,7 @@ class SyntheticEngine:
                 syn["blocked_reason"] = None
                 syn["exit_pending"] = False
                 syn["exit_state"] = None
+                self._clear_pending_on_close(syn)
             elif self._is_reject(status) or self._is_cancel(status):
                 # Plan 06 H1: a rejected/cancelled/expired exit is terminal
                 # failure, not "pending forever". The SL is already cancelled
@@ -375,6 +742,7 @@ class SyntheticEngine:
         elif self._is_complete(status) and syn["status"] == "CLOSING":
             syn["status"] = "CLOSED"
             syn["closed_at_ms"] = t_now
+            self._clear_pending_on_close(syn)
         return None
 
     def _read_book(self):
@@ -429,6 +797,7 @@ class SyntheticEngine:
             syn["exit_reason"] = "SL_HIT"
             syn["naked_position"] = False
             syn["blocked_reason"] = None
+            self._clear_pending_on_close(syn)
         log.info("SL HIT %s entry=%s sl=%s", syn.get("trading_symbol"),
                  syn.get("entry_order_id"), sl_id)
 
@@ -463,11 +832,30 @@ class SyntheticEngine:
         except Exception as e:  # noqa: BLE001 - polling is best effort
             log.error("exit poll request failed: %s", e)
 
-    def _safe_cancel(self, oid: str, why: str):
+    @staticmethod
+    def _resp_ok(res) -> bool:
+        """True only when both `stat` and `stCode` report success."""
+        if not isinstance(res, dict):
+            return True
+        stat = res.get("stat")
+        if stat is not None and str(stat).strip().lower() not in ("ok", "success"):
+            return False
+        code = res.get("stCode")
+        if code is not None:
+            return str(code) == "200"
+        return True
+
+    def _safe_cancel(self, oid: str, why: str) -> bool:
         try:
-            self.broker.cancel(oid)
+            res = self.broker.cancel(oid)
+            if not self._resp_ok(res):
+                log.error("cancel %s (%s) failed: %s", oid, why,
+                          str(res)[:200])
+                return False
+            return True
         except Exception as e:  # noqa: BLE001 - best effort
             log.error("cancel %s (%s) failed: %s", oid, why, e)
+            return False
 
     @staticmethod
     def _new_exit_tag(syn: dict) -> str:
@@ -507,8 +895,9 @@ class SyntheticEngine:
         log.warning("SL AMBIGUOUS RESOLVED BY TAG %s entry=%s tag=%s -> %s",
                     syn.get("trading_symbol"), syn.get("entry_order_id"), tag,
                     syn.get("sl_order_id"))
+        self._sync_sl_from_order(syn, found, "reconcile")
         if self._is_complete(st):
-            self.on_order_update(found)
+            self.on_order_update(found, source="reconcile")
             return "closed"
         return "adopted"
 
@@ -581,7 +970,7 @@ class SyntheticEngine:
             r = self._call_place_with_tag(
                 self.broker.place_market_exit, args,
                 {"transaction_type": exit_txn, "product": product}, tag)
-            ok = bool(r and r.get("stCode") == 200 and r.get("nOrdNo"))
+            ok = bool(self._resp_ok(r) and r and r.get("nOrdNo"))
             err = f"market exit rejected: {str(r)[:300]}"
         except Exception as e:  # noqa: BLE001 - timeout/reset => ambiguous
             r, ok, err = None, False, str(e)[:300]
@@ -830,7 +1219,7 @@ class SyntheticEngine:
                 (exchange, sl_qty, sym, stop_price),
                 {"transaction_type": sl_txn, "product": product}, tag)
             t_sl = int(time.time() * 1000)
-            ok = bool(r and r.get("stCode") == 200)
+            ok = bool(self._resp_ok(r) and r)
             err = str(r)[:300]
         except Exception as e:
             r, t_sl, ok, err = None, int(time.time() * 1000), False, str(e)[:300]
@@ -1154,6 +1543,7 @@ class SyntheticEngine:
                         syn["blocked_reason"] = None
                         syn["exit_pending"] = False
                         syn["exit_state"] = None
+                        self._clear_pending_on_close(syn)
                     log.info("MARKET EXIT COMPLETE %s entry=%s exit=%s",
                              syn.get("trading_symbol"),
                              syn.get("entry_order_id"), xid)
@@ -1384,22 +1774,207 @@ class SyntheticEngine:
             try:
                 status = syn.get("status")
                 if status == "CLOSED":
+                    with self._lock:
+                        self._clear_pending_on_close(syn)
+                    # A CLOSED leg must not leave a live stale SL at the broker.
+                    # A successful cancel is re-confirmed against later books;
+                    # persistent stale rows get a bounded number of retries.
+                    sl_id = str(syn.get("sl_order_id") or "")
+                    sl_od = by_id.get(sl_id) if sl_id else None
+                    sl_st = str((sl_od or {}).get("ordSt", "")).lower()
+                    if sl_od and self._is_open(sl_st):
+                        confirmed = True
+                        if syn.get("closed_sl_cancel_ok_ms"):
+                            need = max(1, int(settings.sl_missing_confirmations))
+                            with self._lock:
+                                streak = int(syn.get(
+                                    "closed_sl_cancel_confirm_streak") or 0) + 1
+                                syn["closed_sl_cancel_confirm_streak"] = streak
+                            if streak < need:
+                                confirmed = False
+                            else:
+                                with self._lock:
+                                    syn.pop("closed_sl_cancel_ok_ms", None)
+                                    syn["closed_sl_cancel_confirm_streak"] = 0
+                        if confirmed:
+                            attempts = int(
+                                syn.get("closed_sl_cancel_attempts") or 0)
+                            limit = max(1, int(
+                                settings.closed_sl_cancel_max_attempts))
+                            if attempts < limit:
+                                with self._lock:
+                                    attempts += 1
+                                    syn["closed_sl_cancel_attempts"] = attempts
+                                    syn["closed_sl_cancel_last_ms"] = now
+                                log.critical(
+                                    "CLOSED STALE SL %s entry=%s: SL %s (%s) "
+                                    "is still working after CLOSED - cancelling "
+                                    "(attempt %s/%s)",
+                                    syn.get("trading_symbol"),
+                                    syn.get("entry_order_id"), sl_id, sl_st,
+                                    attempts, limit)
+                                ok = self._safe_cancel(
+                                    sl_id, "live SL after CLOSED")
+                                driven.append(
+                                    str(syn.get("entry_order_id") or ""))
+                                if ok:
+                                    with self._lock:
+                                        syn["closed_sl_cancel_ok_ms"] = now
+                                        syn["closed_sl_cancel_confirm_streak"] = 0
+                                        syn.pop("closed_sl_cancel_error_ms", None)
+                                    if attempts >= limit:
+                                        with self._lock:
+                                            syn["late_sl_risk"] = True
+                                        log.critical(
+                                            "CLOSED STALE SL RETRIES EXHAUSTED "
+                                            "%s entry=%s SL=%s - MANUAL ACTION "
+                                            "REQUIRED", syn.get("trading_symbol"),
+                                            syn.get("entry_order_id"), sl_id)
+                                else:
+                                    with self._lock:
+                                        syn["closed_sl_cancel_error_ms"] = now
+                                        syn["late_sl_risk"] = True
+                                    log.critical(
+                                        "CLOSED STALE SL CANCEL FAILED %s "
+                                        "entry=%s SL=%s - MANUAL ACTION REQUIRED",
+                                        syn.get("trading_symbol"),
+                                        syn.get("entry_order_id"), sl_id)
+                                    if attempts >= limit:
+                                        log.critical(
+                                            "CLOSED STALE SL RETRIES EXHAUSTED "
+                                            "%s entry=%s SL=%s - MANUAL ACTION "
+                                            "REQUIRED", syn.get("trading_symbol"),
+                                            syn.get("entry_order_id"), sl_id)
+                            elif not syn.get("late_sl_risk"):
+                                with self._lock:
+                                    syn["late_sl_risk"] = True
+                                log.critical(
+                                    "CLOSED STALE SL RISK %s entry=%s SL=%s "
+                                    "still working; retries already exhausted - "
+                                    "MANUAL ACTION REQUIRED",
+                                    syn.get("trading_symbol"),
+                                    syn.get("entry_order_id"), sl_id)
+                    # A working entry left behind by an external flat is also a
+                    # naked-order risk. Retry it on CLOSED reconciles (the leg
+                    # is never revisited by the normal position path).
+                    entry_id = str(syn.get("entry_order_id") or "")
+                    entry_od = by_id.get(entry_id) if entry_id else None
+                    entry_st = str((entry_od or {}).get("ordSt", "")).lower()
+                    if (entry_id and entry_od and self._is_open(entry_st)
+                            and (syn.get("external_flat_entry_cancel_error_ms")
+                                 or syn.get("external_flat_entry_cancel_ok_ms"))):
+                        confirmed = True
+                        # A successful cancel is still re-checked against the
+                        # book: a bad ack must not leave a working entry behind.
+                        if syn.get("external_flat_entry_cancel_ok_ms"):
+                            need = max(1, int(settings.sl_missing_confirmations))
+                            with self._lock:
+                                streak = int(syn.get(
+                                    "external_flat_entry_cancel_confirm_streak")
+                                    or 0) + 1
+                                syn["external_flat_entry_cancel_confirm_streak"] \
+                                    = streak
+                            if streak < need:
+                                confirmed = False
+                            else:
+                                with self._lock:
+                                    syn.pop(
+                                        "external_flat_entry_cancel_ok_ms", None)
+                                    syn[
+                                        "external_flat_entry_cancel_confirm_streak"] \
+                                        = 0
+                        if confirmed:
+                            attempts = int(syn.get(
+                                "external_flat_entry_cancel_attempts") or 0)
+                            limit = max(1, int(settings.entry_cancel_max_attempts))
+                            if attempts < limit:
+                                with self._lock:
+                                    attempts += 1
+                                    syn[
+                                        "external_flat_entry_cancel_attempts"] \
+                                        = attempts
+                                log.critical(
+                                    "EXTERNAL FLAT WORKING ENTRY %s entry=%s: %s "
+                                    "is still open - cancelling (attempt %s/%s)",
+                                    syn.get("trading_symbol"), entry_id, entry_st,
+                                    attempts, limit)
+                                ok = self._safe_cancel(
+                                    entry_id, "working entry after EXTERNAL_FLAT")
+                                driven.append(entry_id)
+                                if ok:
+                                    with self._lock:
+                                        syn.pop(
+                                            "external_flat_entry_cancel_error_ms",
+                                            None)
+                                        syn.pop(
+                                            "external_flat_entry_cancel_alerted",
+                                            None)
+                                        syn[
+                                            "external_flat_entry_cancel_ok_ms"] \
+                                            = now
+                                        syn[
+                                            "external_flat_entry_cancel_confirm_streak"] \
+                                            = 0
+                                else:
+                                    with self._lock:
+                                        syn[
+                                            "external_flat_entry_cancel_error_ms"] \
+                                            = now
+                                    if attempts < limit:
+                                        log.critical(
+                                            "EXTERNAL FLAT ENTRY CANCEL FAILED %s "
+                                            "entry=%s - will retry",
+                                            syn.get("trading_symbol"), entry_id)
+                                    else:
+                                        with self._lock:
+                                            syn[
+                                                "external_flat_entry_cancel_alerted"] \
+                                                = True
+                                        log.critical(
+                                            "EXTERNAL FLAT ENTRY CANCEL RETRIES "
+                                            "EXHAUSTED %s entry=%s - MANUAL "
+                                            "ACTION REQUIRED",
+                                            syn.get("trading_symbol"), entry_id)
+                            elif not syn.get(
+                                    "external_flat_entry_cancel_alerted"):
+                                with self._lock:
+                                    syn[
+                                        "external_flat_entry_cancel_alerted"] \
+                                        = True
+                                log.critical(
+                                    "EXTERNAL FLAT ENTRY CANCEL RETRIES EXHAUSTED "
+                                    "%s entry=%s - MANUAL ACTION REQUIRED",
+                                    syn.get("trading_symbol"), entry_id)
                     tag = str(syn.get("exit_client_tag") or "")
                     late = self._book_by_tag(book, tag) if tag else None
                     late_st = str((late or {}).get("ordSt", "")).lower()
                     late_id = str((late or {}).get("nOrdNo") or "")
                     if late_id and self._is_open(late_st):
-                        log.critical(
-                            "LATE EXIT RISK %s entry=%s: tagged exit %s (%s) "
-                            "is still working after CLOSED - cancelling",
-                            syn.get("trading_symbol"),
-                            syn.get("entry_order_id"), late_id, late_st)
-                        with self._lock:
-                            syn["late_exit_risk"] = True
-                            syn["late_exit_cancelled_ms"] = int(
-                                time.time() * 1000)
-                        self._safe_cancel(late_id, "late tagged exit after CLOSED")
-                        driven.append(str(syn.get("entry_order_id") or ""))
+                        if not syn.get("late_exit_cancelled_ms"):
+                            # Exactly one cancel attempt for a tagged late exit;
+                            # if the book still echoes it, raise the risk alert
+                            # instead of spamming the broker forever.
+                            log.critical(
+                                "LATE EXIT RISK %s entry=%s: tagged exit %s "
+                                "(%s) is still working after CLOSED - cancel",
+                                syn.get("trading_symbol"),
+                                syn.get("entry_order_id"), late_id, late_st)
+                            with self._lock:
+                                syn["late_exit_risk"] = True
+                                syn["late_exit_cancelled_ms"] = int(
+                                    time.time() * 1000)
+                            self._safe_cancel(
+                                late_id, "late tagged exit after CLOSED")
+                            driven.append(str(syn.get("entry_order_id") or ""))
+                        elif not syn.get("late_exit_risk"):
+                            with self._lock:
+                                syn["late_exit_risk"] = True
+                            log.critical(
+                                "LATE EXIT RISK %s entry=%s: tagged exit %s "
+                                "still working after CLOSED — cancel already "
+                                "sent, MANUAL ACTION REQUIRED",
+                                syn.get("trading_symbol"),
+                                syn.get("entry_order_id"), late_id)
                     continue
                 if status == "PENDING_ENTRY":
                     eid = str(syn.get("entry_order_id") or "")
@@ -1408,7 +1983,7 @@ class SyntheticEngine:
                         st = str(od.get("ordSt", "")).lower()
                         if (self._is_complete(st) or self._is_reject(st)
                                 or self._is_cancel(st)):
-                            self.on_order_update(od)
+                            self.on_order_update(od, source="reconcile")
                             driven.append(eid)
                         else:
                             self._check_entry_guarantee(syn, st, now, eid, od)
@@ -1426,8 +2001,12 @@ class SyntheticEngine:
                     od = by_id.get(sl) if sl else None
                     if pstate == "flat":
                         if self._flat_confirmation(syn):
-                            self._mark_external_flat(syn, sl, od)
-                            driven.append(str(syn.get("entry_order_id") or ""))
+                            eid = str(syn.get("entry_order_id") or "")
+                            xid = str(syn.get("exit_order_id") or "")
+                            self._mark_external_flat(syn, sl, od,
+                                                     by_id.get(eid),
+                                                     by_id.get(xid) if xid else None)
+                            driven.append(eid)
                         else:
                             with self._lock:
                                 syn["blocked_reason"] = "POSITION_FLAT_UNCONFIRMED"
@@ -1471,7 +2050,7 @@ class SyntheticEngine:
                     else:
                         st = str(od.get("ordSt", "")).lower()
                         if self._is_complete(st):
-                            self.on_order_update(od)  # position exited via SL
+                            self.on_order_update(od, source="reconcile")  # position exited via SL
                             driven.append(sl)
                         elif self._is_reject(st) or self._is_cancel(st):
                             outcome = self._repair_or_error(
@@ -1482,7 +2061,9 @@ class SyntheticEngine:
                                 errored.append(sl)
                                 naked.append(sl)
                         else:
-                            # SL is working: reset the miss/replace episode.
+                            # SL is working: adopt any manual trigger/qty change
+                            # first (feed/book wins), then reset the miss episode.
+                            self._sync_sl_from_order(syn, od, "reconcile")
                             with self._lock:
                                 syn["sl_missing_streak"] = 0
                                 syn["sl_last_seen_ms"] = now
@@ -1547,6 +2128,20 @@ class SyntheticEngine:
                         driven.append(str(syn.get("entry_order_id") or ""))
                     else:
                         self._reset_flat_confirmation(syn)
+                elif status == "ERRORED" and syn.get("exit_ambiguous"):
+                    # Resolve a timed-out exit by tag before any retry. This must
+                    # be checked before the naked branch: a manual SL cancel can
+                    # mark the leg naked while its market exit is still live, and
+                    # the naked branch would otherwise ignore that exit forever.
+                    res = self._drive_exit(
+                        syn, book, True, positions=positions,
+                        positions_ok=positions_ok)
+                    driven.append(str(syn.get("entry_order_id") or ""))
+                    if res in ("closed", "sl_hit"):
+                        with self._lock:
+                            syn["source"] = "reconcile"
+                    if res == "blocked":
+                        errored.append(str(syn.get("entry_order_id") or ""))
                 elif status == "ERRORED" and syn.get("naked_position"):
                     # 06a gap: a missing SL that reappears later must heal the
                     # leg instead of leaving it ERRORED forever.
@@ -1568,6 +2163,33 @@ class SyntheticEngine:
                             log.info("reconcile: %s SL %s reappeared — leg restored to %s",
                                      syn.get("trading_symbol"), sl, syn.get("status"))
                 elif status == "CLOSING":
+                    # Plan 06 WP5: a manual/external flatten during CLOSING must
+                    # converge to CLOSED, not stay CLOSING or fire another exit.
+                    # Require the same two fresh flat snapshots as ACTIVE legs so
+                    # one lagging/empty response can never trigger this.
+                    pstate, pdetail = self._position_state(
+                        syn, positions, positions_ok)
+                    if pstate == "flat":
+                        sl = str(syn.get("sl_order_id") or "")
+                        sl_od = by_id.get(sl) if sl else None
+                        eid = str(syn.get("entry_order_id") or "")
+                        entry_od = by_id.get(eid)
+                        xid = str(syn.get("exit_order_id") or "")
+                        if self._flat_confirmation(syn):
+                            self._mark_external_flat(
+                                syn, sl, sl_od, entry_od,
+                                by_id.get(xid) if xid else None)
+                            driven.append(eid)
+                        else:
+                            with self._lock:
+                                syn["blocked_reason"] = "POSITION_FLAT_UNCONFIRMED"
+                                syn["naked_position"] = False
+                            log.warning("CLOSING POSITION FLAT UNCONFIRMED %s "
+                                        "entry=%s: one flat snapshot, waiting "
+                                        "before closing (no market exit)",
+                                        syn.get("trading_symbol"), eid)
+                        continue
+                    self._reset_flat_confirmation(syn)
                     # Always examine a CLOSING leg (even with an exit id) so a
                     # feed-dead late SL fill is caught (M6) and missing exits
                     # cannot wedge silently (M5).
@@ -1575,14 +2197,9 @@ class SyntheticEngine:
                         syn, book, True, positions=positions,
                         positions_ok=positions_ok)
                     driven.append(str(syn.get("entry_order_id") or ""))
-                    if res == "blocked":
-                        errored.append(str(syn.get("entry_order_id") or ""))
-                elif status == "ERRORED" and syn.get("exit_ambiguous"):
-                    # Resolve a timed-out exit by tag before any retry.
-                    res = self._drive_exit(
-                        syn, book, True, positions=positions,
-                        positions_ok=positions_ok)
-                    driven.append(str(syn.get("entry_order_id") or ""))
+                    if res in ("closed", "sl_hit"):
+                        with self._lock:
+                            syn["source"] = "reconcile"
                     if res == "blocked":
                         errored.append(str(syn.get("entry_order_id") or ""))
                 with self._lock:
@@ -1689,8 +2306,14 @@ class SyntheticEngine:
                                 f"{expected:g}")
         return "ok", f"position {net:g} shares"
 
-    def _mark_external_flat(self, syn: dict, sl: str, sl_od: dict | None):
-        """Position is already flat (manual/external) — never reopen it."""
+    def _mark_external_flat(self, syn: dict, sl: str, sl_od: dict | None,
+                            entry_od: dict | None = None,
+                            exit_od: dict | None = None):
+        """Position is already flat (manual/external) - never reopen it.
+
+        Cancel any still-working SL/entry/exit exactly once (the leg is CLOSED
+        first, so later reconciles cannot repeat the cancel). A working exit is
+        the dangerous one: the broker could fill it after we saw flat."""
         with self._lock:
             if syn.get("status") == "CLOSED":
                 return
@@ -1702,14 +2325,88 @@ class SyntheticEngine:
             syn["exit_pending"] = False
             syn["exit_state"] = None
             syn["position_flat_streak"] = 0
-        log.warning("EXTERNAL FLAT %s entry=%s: broker position is flat — "
+            self._clear_pending_on_close(syn)
+            syn["last_synced_ms"] = syn["closed_at_ms"]
+            syn["source"] = "external"
+        log.warning("EXTERNAL FLAT %s entry=%s: broker position is flat - "
                     "closing tracker, no SL repair",
                     syn.get("trading_symbol"), syn.get("entry_order_id"))
-        if sl and sl_od is not None:
-            st = str(sl_od.get("ordSt", "")).lower()
+        entry_id = str(syn.get("entry_order_id") or "")
+        sl_cancel_ok = False
+        for oid, od, why in ((sl, sl_od, "position externally flat (SL)"),
+                             (entry_id, entry_od, "position externally flat (entry)")):
+            if not oid or od is None:
+                continue
+            st = str(od.get("ordSt", "")).lower()
             if not (self._is_complete(st) or self._is_cancel(st)
                     or self._is_reject(st)):
-                self._safe_cancel(sl, "position externally flat")
+                ok = self._safe_cancel(oid, why)
+                now = int(time.time() * 1000)
+                if oid == sl:
+                    sl_cancel_ok = ok
+                    if not ok:
+                        with self._lock:
+                            syn["closed_sl_cancel_attempts"] = max(
+                                1, int(syn.get("closed_sl_cancel_attempts") or 0))
+                            syn["closed_sl_cancel_error_ms"] = now
+                            syn["late_sl_risk"] = True
+                        log.critical(
+                            "EXTERNAL FLAT %s entry=%s: could not cancel "
+                            "working SL %s - MANUAL ACTION REQUIRED",
+                            syn.get("trading_symbol"),
+                            syn.get("entry_order_id"), sl)
+                elif oid == entry_id and not ok:
+                    with self._lock:
+                        syn["external_flat_entry_cancel_attempts"] = max(
+                            1, int(syn.get(
+                                "external_flat_entry_cancel_attempts") or 0))
+                        syn["external_flat_entry_cancel_error_ms"] = now
+                        syn["external_flat_entry_cancel_alerted"] = False
+                    log.critical(
+                        "EXTERNAL FLAT %s entry=%s: could not cancel "
+                        "working entry %s - MANUAL ACTION REQUIRED",
+                        syn.get("trading_symbol"), entry_id, entry_id)
+                elif oid == entry_id and ok:
+                    # Still re-confirm on later books before trusting the ack.
+                    with self._lock:
+                        syn["external_flat_entry_cancel_attempts"] = max(
+                            1, int(syn.get(
+                                "external_flat_entry_cancel_attempts") or 0))
+                        syn["external_flat_entry_cancel_ok_ms"] = now
+                        syn["external_flat_entry_cancel_confirm_streak"] = 0
+                        syn.pop("external_flat_entry_cancel_error_ms", None)
+                        syn.pop("external_flat_entry_cancel_alerted", None)
+        if sl_cancel_ok:
+            # Do not suppress later stale-book checks forever: a successful
+            # cancel still has to be re-confirmed against a subsequent book.
+            now = int(time.time() * 1000)
+            with self._lock:
+                syn["closed_sl_cancel_attempts"] = max(
+                    1, int(syn.get("closed_sl_cancel_attempts") or 0))
+                syn["closed_sl_cancel_last_ms"] = now
+                syn["closed_sl_cancel_ok_ms"] = now
+                syn["closed_sl_cancel_confirm_streak"] = 0
+                syn.pop("closed_sl_cancel_error_ms", None)
+                syn["late_sl_risk"] = False
+        exit_id = str(syn.get("exit_order_id") or "")
+        exit_st = str((exit_od or {}).get("ordSt", "")).lower()
+        exit_terminal = bool(exit_od) and (
+            self._is_complete(exit_st) or self._is_cancel(exit_st)
+            or self._is_reject(exit_st))
+        if exit_id and not exit_terminal:
+            now = int(time.time() * 1000)
+            if self._safe_cancel(exit_id, "position externally flat (exit)"):
+                with self._lock:
+                    syn["late_exit_cancelled_ms"] = now
+            else:
+                with self._lock:
+                    syn["late_exit_risk"] = True
+                    syn["late_exit_cancel_error_ms"] = now
+                log.critical("EXTERNAL FLAT %s entry=%s: could not cancel "
+                             "working exit %s — possible late fill, MANUAL "
+                             "ACTION REQUIRED",
+                             syn.get("trading_symbol"),
+                             syn.get("entry_order_id"), exit_id)
 
     def _mark_position_mismatch(self, syn: dict, detail: str):
         with self._lock:
@@ -1786,7 +2483,7 @@ class SyntheticEngine:
             return "waiting"
         try:
             r = self.broker.cancel(entry_id)
-            ok = not isinstance(r, dict) or r.get("stCode") == 200
+            ok = self._resp_ok(r)
             err = None if ok else str(r)[:200]
         except Exception as e:  # noqa: BLE001 - retry within the budget
             ok, err = False, str(e)[:200]
@@ -1862,7 +2559,29 @@ class SyntheticEngine:
         any repair. A flat position is closed as EXTERNAL_FLAT (never reopened);
         an opposite/short position is ERRORED + POSITION_MISMATCH.
         """
+        if self._sl_modify_active(syn):
+            # A manual broker-app modify is in flight: never fight it by
+            # re-placing the old stop. The next feed/book snapshot wins.
+            log.info("SL REPAIR DEFERRED %s entry=%s: manual modify pending "
+                     "(target=%s)", syn.get("trading_symbol"),
+                     syn.get("entry_order_id"), syn.get("sl_modify_target"))
+            return "skipped"
         pstate, pdetail = self._position_state(syn, positions, positions_ok)
+        if pstate == "unknown" and syn.get("manual_sl_cancel"):
+            # No authoritative position snapshot, but the operator explicitly
+            # cancelled the SL: make the unprotected state explicit and never
+            # auto-re-place the stop.
+            self._mark_naked(
+                syn, "SL_CANCELLED_MANUAL",
+                f"SL {sl} was cancelled manually — position unprotected "
+                "(automatic re-place suppressed)")
+            with self._lock:
+                syn["manual_sl_cancel_pending"] = False
+                syn["manual_sl_cancel_deadline_ms"] = None
+                syn["manual_sl_cancel_confirmed"] = True
+                syn["exit_pending"] = False
+                syn["exit_state"] = "BLOCKED"
+            return "errored"
         if pstate == "unknown":
             self._reset_flat_confirmation(syn)
             with self._lock:
@@ -1887,6 +2606,20 @@ class SyntheticEngine:
         self._reset_flat_confirmation(syn)
         if pstate == "mismatch":
             self._mark_position_mismatch(syn, pdetail)
+            return "errored"
+        if syn.get("manual_sl_cancel"):
+            # Cancel came from this app's Orders panel: respect it, make the
+            # naked position explicit, and never silently re-place the stop.
+            self._mark_naked(
+                syn, "SL_CANCELLED_MANUAL",
+                f"SL {sl} was cancelled manually — position unprotected "
+                "(automatic re-place suppressed)")
+            with self._lock:
+                syn["manual_sl_cancel_pending"] = False
+                syn["manual_sl_cancel_deadline_ms"] = None
+                syn["manual_sl_cancel_confirmed"] = True
+                syn["exit_pending"] = False
+                syn["exit_state"] = "BLOCKED"
             return "errored"
         with self._lock:
             prev_status = syn.get("status")
@@ -1989,6 +2722,10 @@ class SyntheticEngine:
 
     def _trail(self, syn: dict, ltp: float):
         update = None
+        if self._sl_modify_active(syn):
+            # Do not let the trailing ratchet overwrite an operator's manual
+            # trigger while that modify is still in flight (Plan 06 WP5).
+            return
         with self._lock:
             side = syn.get("side", "B")
             sl_txn = "B" if side == "S" else "S"
@@ -2017,9 +2754,19 @@ class SyntheticEngine:
         if update is None:
             return
         sl_id, qty, price, sl_txn, new_sl = update
+        with self._lock:
+            # Record our own in-flight trigger so the feed echo is not
+            # misattributed as an external (broker-app) modification.
+            syn["sl_app_modify_target"] = new_sl
+            syn["sl_app_modify_ms"] = int(time.time() * 1000)
         try:
-            self.broker.modify_sl(sl_id, qty, price, transaction_type=sl_txn)
-        except Exception as e:
+            res = self.broker.modify_sl(sl_id, qty, price,
+                                        transaction_type=sl_txn)
+            if not self._resp_ok(res):
+                raise RuntimeError(str(res)[:200])
+        except Exception as e:  # noqa: BLE001 - log and clear the echo marker
+            with self._lock:
+                syn.pop("sl_app_modify_target", None)
             log.error("trail modify failed: %s", e)
             return
         with self._lock:

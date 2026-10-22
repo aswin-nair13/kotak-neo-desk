@@ -11,6 +11,7 @@ import asyncio
 import logging
 import threading
 import time
+from datetime import datetime, timedelta, timezone
 
 from .broker_worker import CommandWorker
 from .config import settings
@@ -20,6 +21,110 @@ log = logging.getLogger("sfeed")
 
 def _now_ms() -> int:
     return int(time.time() * 1000)
+
+
+# Broker wall-clock timestamps are IST (Asia/Kolkata, no DST). Naive strings
+# must be interpreted in IST regardless of the host timezone, otherwise on a
+# UTC host every row looks hours stale and versioning breaks.
+_IST = timezone(timedelta(hours=5, minutes=30))
+
+_NUMERIC_TIME_FMTS = (
+    "%d-%b-%Y %H:%M:%S", "%d-%b-%Y %H:%M",
+    "%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M",
+    "%d/%m/%Y %H:%M:%S", "%d-%m-%Y %H:%M:%S",
+    "%Y%m%d%H%M%S",
+)
+
+# Exchange/broker last-update fields, in preference order. `updRecvTm` is the
+# SDK's nanosecond receive time; `hsUpTm` is the exchange update wall clock.
+_UPDATE_KEYS = (
+    "updRecvTm", "updRecvTime", "updrecvtm", "hsUpTm", "hsUpTime", "hsUptm",
+    "updTm", "ordUpdTm", "orderUpdateTime", "lastUpdateTime",
+)
+_CREATE_KEYS = ("ordDtTm", "ord_dt_tm", "order_time", "ordTm", "ordDateTime",
+                "orderTime", "createdAt")
+
+
+def _numeric_epoch_ms(f: float) -> int:
+    """Epoch value -> ms, accepting seconds / ms / us / ns magnitudes."""
+    a = abs(f)
+    if a >= 1e17:      # nanoseconds
+        return int(f / 1e6)
+    if a >= 1e14:      # microseconds
+        return int(f / 1e3)
+    if a >= 1e11:      # milliseconds
+        return int(f)
+    return int(f * 1000)
+
+
+def parse_broker_time_ms(value) -> int | None:
+    """Broker timestamp (epoch number or IST wall clock) -> epoch ms.
+
+    Numeric values may be ns/ms/s. Text values with an explicit offset (or a
+    trailing Z) keep it; naive text is assumed IST. None when unparseable.
+    """
+    if value in (None, ""):
+        return None
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return _numeric_epoch_ms(float(value))
+    s = str(value).strip()
+    try:
+        return _numeric_epoch_ms(float(s))
+    except (TypeError, ValueError):
+        pass
+    iso = s[:-1] + "+00:00" if s.endswith("Z") else s
+    try:
+        dt = datetime.fromisoformat(iso)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=_IST)
+        return int(dt.timestamp() * 1000)
+    except ValueError:
+        pass
+    text = s.replace("T", " ")[:19]
+    for fmt in _NUMERIC_TIME_FMTS:
+        try:
+            dt = datetime.strptime(text, fmt).replace(tzinfo=_IST)
+            return int(dt.timestamp() * 1000)
+        except ValueError:
+            continue
+    return None
+
+
+def _src_get(src, key):
+    if isinstance(src, dict):
+        return src.get(key)
+    return getattr(src, key, None)
+
+
+def _last_update_ms(src) -> int | None:
+    for k in _UPDATE_KEYS:
+        ms = parse_broker_time_ms(_src_get(src, k))
+        if ms is not None:
+            return ms
+    return None
+
+
+def _created_ms(src) -> int | None:
+    for k in _CREATE_KEYS:
+        ms = parse_broker_time_ms(_src_get(src, k))
+        if ms is not None:
+            return ms
+    return None
+
+
+def _version_fields(src) -> dict:
+    """Row versioning: prefer the update time, else the creation time.
+
+    `update_ts_source` records which one was used so the engine never treats a
+    creation timestamp as a modification version.
+    """
+    upd = _last_update_ms(src)
+    if upd is not None:
+        return {"update_ts_ms": upd, "update_ts_source": "update"}
+    created = _created_ms(src)
+    if created is not None:
+        return {"update_ts_ms": created, "update_ts_source": "created"}
+    return {"update_ts_ms": None, "update_ts_source": None}
 
 
 class OrderFeedStale(RuntimeError):
@@ -48,7 +153,9 @@ def map_feed_message(msg) -> dict | None:
 
 def map_order_data(d) -> dict:
     """OrderUpdate.data -> TransTrader-style order dict for engine + UI.
-    t_feed_ms stamps server receipt of the exchange update (click-to-fill math)."""
+    t_feed_ms stamps server receipt of the exchange update (click-to-fill math).
+    trigger_price carries an SL's current trigger so a manual broker-app modify
+    can be synced into the tracker (Plan 06 WP5)."""
     tx = getattr(d, "transaction_type", "?")
     return {
         "nOrdNo": str(getattr(d, "order_id", "")),
@@ -59,11 +166,15 @@ def map_order_data(d) -> dict:
         "brdLtQty": str(getattr(d, "quantity", "0")),
         "prc": str(getattr(d, "average_price", "0")),
         "fldQty": getattr(d, "filled_quantity", 0),
+        "trigger_price": str(getattr(d, "trigger_price", None)
+                             or getattr(d, "trgPrc", None)
+                             or getattr(d, "triggerPrice", None) or ""),
         "rejRsn": str(getattr(d, "reject_reason", None) or getattr(d, "rejRsn", None) or "--"),
         "guiOrdId": str(getattr(d, "gui_order_id", None)
                         or getattr(d, "GuiOrdId", None)
                         or getattr(d, "tag", None) or ""),
         "t_feed_ms": int(time.time() * 1000),
+        **_version_fields(d),
     }
 
 
@@ -95,13 +206,59 @@ def map_book_entry(d: dict) -> dict | None:
         "brdLtQty": str(qty),
         "prc": str(g("avgPrc", "average_price", "avgPrc", "prc", "price", default="0")),
         "fldQty": g("fldQty", "filled_quantity", default=0),
+        "filled_qty": g("fldQty", "filled_quantity", default=0),
+        # Trigger is needed to adopt a manual broker-app SL modify (Plan 06 WP5).
+        "trigger_price": str(g("trgPrc", "trigger_price", "triggerPrice",
+                               default="")),
         "rejRsn": str(g("rejRsn", "reject_reason", default="--")),
         # Client tag echoed by Kotak as GuiOrdId. The engine uses it to adopt a
         # market exit whose placement response timed out (Plan 06 M1) instead of
         # firing a second exit.
         "guiOrdId": str(g("GuiOrdId", "guiOrdId", "tag", default="")),
+        # Raw broker creation timestamp (if any) lets the Orders panel show
+        # order age. Never use it as a modification version (see below).
+        "ord_time": str(g("ordDtTm", "ord_dt_tm", "order_time", "ordTm",
+                          "ordDateTime", "orderTime", "createdAt", default="")),
         "t_feed_ms": int(time.time() * 1000),
+        # Versioned by the exchange/broker update time (updRecvTm/hsUpTm),
+        # falling back to the creation time only when no update time exists.
+        **_version_fields(d),
     }
+
+
+def parse_order_book(raw) -> tuple[list[dict], bool]:
+    """Raw order_report() response -> (rows, ok).
+
+    `ok=False` means the response was a failure/unusable shape, never an
+    authoritative empty book. Shared by reconcile (via `fetch_book`) and the
+    Orders panel so both agree on what "flat" means (Plan 06 WP5/WP7).
+    """
+    rows: list = []
+    ok = False
+    if isinstance(raw, dict):
+        data = raw.get("data")
+        error = any(
+            isinstance(v, str) and k.lower() in
+            ("error", "error message", "errmsg", "error_msg")
+            for k, v in raw.items())
+        if isinstance(data, list):
+            rows = data
+            ok = True
+        elif data is None and "data" in raw and not error:
+            # SDK success shape for "no orders today": authoritative empty book.
+            ok = True
+        stat = raw.get("stat")
+        if stat is not None and str(stat).strip().lower() not in ("ok", "success"):
+            # `stat: Not_Ok` with data:null/[] is a failed fetch, not an empty
+            # book (Plan 06 WP6 honesty requirement).
+            rows, ok = [], False
+        code = raw.get("stCode")
+        if code is not None and str(code) != "200":
+            rows, ok = [], False
+    elif isinstance(raw, list):
+        rows = raw
+        ok = True
+    return rows, ok
 
 
 class SFeedBridge:
@@ -156,6 +313,10 @@ class SFeedBridge:
         self._reconcile_queued = 0
         self._reconcile_pending_force = False
         self._last_positions_ok = False
+        self._last_positions_ms: int | None = None
+        self._last_positions_error: str | None = None
+        self._last_book_ms: int | None = None
+        self._last_book_ok = False
         self._poll_lock = threading.Lock()
         self._poll_timer: threading.Timer | None = None
         self._poll_due_ms: int | None = None
@@ -184,6 +345,10 @@ class SFeedBridge:
         self._last_reconcile_error_ms = None
         self._last_reconcile_summary = {}
         self._last_positions_ok = False
+        self._last_positions_ms = None
+        self._last_positions_error = None
+        self._last_book_ms = None
+        self._last_book_ok = False
         self._order_connected = False
         self._watchdog_reconnects = 0
         self._quiet_warned = False
@@ -249,6 +414,11 @@ class SFeedBridge:
                 self._reconcile_pending_force = False
             log.warning("reconcile (%s) not queued: worker unavailable", source)
         return ok
+
+    def request_reconcile(self, source: str = "orders-api") -> bool:
+        """Public hook for route-side actions (cancel/modify) to schedule one
+        authoritative reconcile on the worker (never a direct broker call)."""
+        return self._schedule_reconcile(source, force=True)
 
     def request_exit_poll(self, delay_sec: float = 0.0) -> bool:
         """Queue one exit follow-up reconcile, optionally after a delay.
@@ -395,6 +565,13 @@ class SFeedBridge:
             "last_reconcile_error": self._last_reconcile_error,
             "last_reconcile_error_ms": self._last_reconcile_error_ms,
             "last_reconcile": dict(self._last_reconcile_summary),
+            "last_positions_ms": self._last_positions_ms,
+            "last_positions_age_ms": age(self._last_positions_ms),
+            "last_positions_ok": self._last_positions_ok,
+            "last_positions_error": self._last_positions_error,
+            "last_book_ms": self._last_book_ms,
+            "last_book_age_ms": age(self._last_book_ms),
+            "last_book_ok": self._last_book_ok,
             "watchdog_reconnects": self._watchdog_reconnects,
             "worker": self.worker.status(),
         }
@@ -598,24 +775,11 @@ class SFeedBridge:
         book_ok = False
         try:
             raw = self.kotak.order_book()
-            if isinstance(raw, dict):
-                data = raw.get("data")
-                error = any(
-                    isinstance(v, str) and k.lower() in
-                    ("error", "error message", "errmsg", "error_msg")
-                    for k, v in raw.items())
-                if isinstance(data, list):
-                    book_rows = data
-                    book_ok = True
-                elif data is None and "data" in raw and not error:
-                    # SDK success shape for "no orders today": authoritative
-                    # empty book, not a failed fetch.
-                    book_ok = True
-            elif isinstance(raw, list):
-                book_rows = raw
-                book_ok = True
+            book_rows, book_ok = parse_order_book(raw)
         except Exception as e:
             log.error("reconcile order_book failed: %s", e)
+        self._last_book_ms = _now_ms()
+        self._last_book_ok = book_ok
         book = [m for m in (map_book_entry(r) for r in book_rows) if m]
         return book, book_ok
 
@@ -635,10 +799,16 @@ class SFeedBridge:
                 # Older/custom broker doubles only accept positions().
                 positions = self.kotak.positions() or {}
             self._last_positions_ok = True
+            self._last_positions_ms = _now_ms()
+            self._last_positions_error = None
         except Exception as e:
             log.error("reconcile positions failed: %s", e)
             positions = {}
             self._last_positions_ok = False
+            self._last_positions_ms = _now_ms()
+            # /api/health is only readable by an authenticated user, but keep the
+            # exposed text to the exception type (no SDK/session details).
+            self._last_positions_error = type(e).__name__
         return book, positions, book_ok
 
     async def _subscribe_wanted(self, ws, extra=None):

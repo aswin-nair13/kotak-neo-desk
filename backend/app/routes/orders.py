@@ -1,8 +1,10 @@
 """Order endpoints: single leg, straddle (CE+PE), cancel/modify, synthetic list, orderbook."""
 
 import logging
+import re
 import threading
 import time
+from datetime import datetime
 
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import JSONResponse
@@ -12,6 +14,7 @@ from ..broker_worker import WorkerQueueFull
 from ..config import settings
 from ..kotak_client import KotakService
 from ..schemas import ExitBody, ForceExitBody, SingleOrderBody, StraddleBody
+from ..sfeed_bridge import map_book_entry, parse_order_book
 from ..synthetic_engine import SyntheticEngine
 from ..ws_manager import Hub
 
@@ -24,10 +27,13 @@ engine: SyntheticEngine | None = None
 hub: Hub | None = None
 bridge = None  # SFeedBridge, wired in main.py
 worker = None  # CommandWorker, wired in main.py (None in unit tests -> direct)
+# Read-only broker calls (order book / positions UI) must never enter the
+# single-writer mutation queue: a slow read would delay a queued cancel/exit.
+read_worker = None  # dedicated CommandWorker, wired in main.py
 
 
 def _run_on_worker(fn, *args, label: str | None = None, **kwargs):
-    """Run a route-side command on the single writer and map timeout/backlog.
+    """Run a route-side mutation on the single writer and map backlog errors.
 
     Place (broker call + engine.add) and exit (cancel + mark + market order)
     must be one worker command, otherwise an order update can be processed
@@ -37,11 +43,29 @@ def _run_on_worker(fn, *args, label: str | None = None, **kwargs):
         return fn(*args, **kwargs)
     try:
         return worker.submit_wait(
-            fn, *args, label=label or getattr(fn, "__name__", "command"), **kwargs)
+            fn, *args, label=label or getattr(fn, "__name__", "command"),
+            **kwargs)
     except TimeoutError as e:
         raise HTTPException(status_code=504, detail=f"Broker command timed out: {e}")
     except WorkerQueueFull as e:
         raise HTTPException(status_code=503, detail=f"Broker queue full: {e}")
+
+
+def _run_read(fn, *args, label: str | None = None,
+              timeout: float | None = None, **kwargs):
+    """Run a read-only broker call on the dedicated read worker."""
+    if read_worker is None:
+        return fn(*args, **kwargs)
+    wait = (max(0.1, float(settings.orderbook_timeout_sec))
+            if timeout is None else timeout)
+    try:
+        return read_worker.submit_wait(
+            fn, *args, label=label or getattr(fn, "__name__", "read"),
+            timeout=wait, **kwargs)
+    except TimeoutError as e:
+        raise HTTPException(status_code=504, detail=f"Broker read timed out: {e}")
+    except WorkerQueueFull as e:
+        raise HTTPException(status_code=503, detail=f"Broker read queue full: {e}")
 
 
 def _broker_call(fn, *args, label: str | None = None, **kwargs):
@@ -84,6 +108,18 @@ def _idem_store(tag: str | None, resp: dict):
 
 def _lot(instrument: str) -> int:
     return settings.sensex_lot if instrument == "SENSEX" else settings.nifty_lot
+
+
+def _positive_int_qty(raw) -> str | None:
+    """Broker v3 order qty must be a positive integer string (`"20"`, not
+    `"20.0"`/`"20.5"`). Returns None when invalid."""
+    try:
+        value = float(str(raw).strip())
+    except (TypeError, ValueError):
+        return None
+    if value <= 0 or not value.is_integer():
+        return None
+    return str(int(value))
 
 
 def _require_master():
@@ -152,6 +188,126 @@ def _ms() -> int:
     return int(time.time() * 1000)
 
 
+_SECRET_RE = re.compile(
+    r"(?i)\b(token|sid|rid|authorization|bearer|session|password)\b"
+    r"\s*[=:]?\s*[A-Za-z0-9._\-]+")
+
+
+def _safe_text(value, limit: int = 200) -> str:
+    """One-line, credential-redacted broker text for API/log surfaces."""
+    s = str(value or "").replace("\n", " ").replace("\r", " ")
+    s = _SECRET_RE.sub(lambda m: f"{m.group(1)}=<redacted>", s)
+    return s[:limit]
+
+
+def _broker_ok(res) -> bool:
+    """Broker success check: both `stat` and `stCode` must agree.
+
+    `stCode=200` plus `stat=Not_Ok` is a failure, not a success.
+    """
+    if not isinstance(res, dict):
+        return True
+    stat = res.get("stat")
+    if stat is not None and str(stat).strip().lower() not in ("ok", "success"):
+        return False
+    code = res.get("stCode")
+    if code is not None:
+        return str(code) == "200"
+    return True
+
+
+def _safe_result(res) -> dict:
+    """Small sanitized broker response body (never a raw session-bearing dict)."""
+    if not isinstance(res, dict):
+        return {"result": _safe_text(res)}
+    out = {}
+    for k in ("stCode", "stat", "nOrdNo", "errMsg", "message", "Error"):
+        if k in res:
+            v = res.get(k)
+            out[k] = _safe_text(v) if isinstance(v, str) else v
+    return out or {"result": _safe_text(res)}
+
+
+def _request_reconcile(source: str):
+    """Schedule one authoritative reconcile after a successful route action."""
+    if bridge is None:
+        return
+    fn = getattr(bridge, "request_reconcile", None)
+    try:
+        if fn is not None:
+            fn(source)
+        else:
+            bridge.request_exit_poll(0)
+    except Exception as e:  # noqa: BLE001 - reconcile scheduling is best effort
+        log.error("schedule reconcile (%s) failed: %s", source, _safe_text(e))
+
+
+_ORDER_TIME_FORMATS = (
+    "%d-%b-%Y %H:%M:%S", "%d-%b-%Y %H:%M",
+    "%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M",
+    "%d/%m/%Y %H:%M:%S", "%d-%m-%Y %H:%M:%S",
+)
+
+
+def _parse_order_time(value) -> int | None:
+    """Best-effort broker order timestamp -> epoch ms (None if unparseable)."""
+    if value in (None, ""):
+        return None
+    if isinstance(value, (int, float)):
+        f = float(value)
+        return int(f if f > 1e11 else f * 1000)
+    s = str(value).strip()
+    try:
+        f = float(s)
+        return int(f if f > 1e11 else f * 1000)
+    except (TypeError, ValueError):
+        pass
+    text = s.replace("T", " ").replace("Z", "")[:19]
+    for fmt in _ORDER_TIME_FORMATS:
+        try:
+            return int(datetime.strptime(text, fmt).timestamp() * 1000)  # noqa: DTZ007
+        except ValueError:
+            continue
+    return None
+
+
+def _book_row(raw) -> dict | None:
+    row = map_book_entry(raw)
+    if row is None:
+        return None
+    placed = _parse_order_time(row.get("ord_time"))
+    row["age_ms"] = max(0, _ms() - placed) if placed else None
+    # Explicit aliases so the panel does not depend on Kotak's wire names.
+    row["status"] = row.get("ordSt")
+    row["price"] = row.get("prc")
+    row["filled_qty"] = row.get("fldQty")
+    return row
+
+
+def _orderbook_impl():
+    """Worker-side order-book read: normalized rows + fetch freshness."""
+    assert kotak is not None
+    fetched = _ms()
+    try:
+        raw = kotak.order_book()
+    except Exception as e:  # noqa: BLE001 - surfaced as a structured failure
+        log.error("order book read failed: %s", _safe_text(e))
+        return {"ok": False, "orders": [], "count": 0,
+                "error": _safe_text(e), "fetched_at_ms": fetched,
+                "age_ms": 0, "stale": True, "source": "broker"}
+    rows, ok = parse_order_book(raw)
+    if not ok:
+        log.error("order book returned an unusable response: %s", _safe_text(raw))
+        return {"ok": False, "orders": [], "count": 0,
+                "error": "broker returned an unusable order-book response",
+                "fetched_at_ms": fetched, "age_ms": _ms() - fetched,
+                "stale": True, "source": "broker"}
+    orders = [r for r in (_book_row(x) for x in rows) if r]
+    return {"ok": True, "orders": orders, "count": len(orders),
+            "fetched_at_ms": fetched, "age_ms": _ms() - fetched,
+            "stale": False, "source": "broker"}
+
+
 def _place_tracked(exchange, symbol, qty, entry, body_target, body_stop, strategy, trail, product,
                    side: str = "B", t_recv_ms: int | None = None, tag: str | None = None):
     """Place entry as plain Limit; SL/target/trailing are managed synthetically by the engine.
@@ -173,7 +329,7 @@ def _place_tracked(exchange, symbol, qty, entry, body_target, body_stop, strateg
     # Runs inside one _run_on_worker command together with engine.add below.
     r = kotak.place_order(**kw)
     t_b1 = _ms()
-    if not (r and r.get("stCode") == 200):
+    if not (r and _broker_ok(r)):
         raise HTTPException(status_code=502, detail=f"Entry rejected for {symbol}: {r}")
     entry_id = r.get("nOrdNo")
     log.info("entry order placed symbol=%s order=%s side=%s qty=%s",
@@ -262,24 +418,147 @@ def list_synthetic():
 
 @router.get("/orderbook", dependencies=[Depends(require_user)])
 def orderbook():
+    """Normalized working/pending/rejected rows + fetch freshness (Plan 06 WP6).
+
+    A failed read is never reported as a successful empty book: it returns a
+    structured `ok:false` body with a 5xx status.
+    """
     assert kotak is not None
     try:
-        return _broker_call(kotak.order_book)  # v3: order_report()
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=502, detail=str(e))
+        res = _run_read(_orderbook_impl, label="orderbook")
+    except HTTPException as e:
+        return JSONResponse(status_code=e.status_code, content={
+            "ok": False, "orders": [], "count": 0,
+            "error": _safe_text(e.detail), "fetched_at_ms": _ms(),
+            "stale": True, "source": "broker"})
+    except Exception as e:  # noqa: BLE001
+        return JSONResponse(status_code=502, content={
+            "ok": False, "orders": [], "count": 0,
+            "error": _safe_text(e), "fetched_at_ms": _ms(),
+            "stale": True, "source": "broker"})
+    if not res.get("ok"):
+        return JSONResponse(status_code=502, content=res)
+    return res
 
 
 @router.post("/cancel/{order_id}", dependencies=[Depends(require_user)])
 def cancel(order_id: str):
     assert kotak is not None
     try:
-        return _broker_call(kotak.cancel, order_id)
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=502, detail=str(e))
+        res = _run_on_worker(_cancel_impl, order_id,
+                             label=f"cancel:{order_id}")
+    except HTTPException as e:
+        return JSONResponse(status_code=e.status_code, content={
+            "ok": False, "action": "cancel", "order_id": order_id,
+            "error": _safe_text(e.detail)})
+    if not (res.get("ok") or res.get("already")):
+        return JSONResponse(status_code=502, content=res)
+    return res
+
+
+def _cancel_impl(order_id: str, schedule: bool = True) -> dict:
+    """Cancel one broker order on the worker, idempotently.
+
+    The tracker records the requested id *before* the feed confirms, so a
+    double-click / retry cannot send a second cancel. On success a reconcile is
+    scheduled so the tracker converges from the broker book even with a dead feed.
+    """
+    assert kotak is not None and engine is not None
+    oid = str(order_id).strip()
+    if not oid:
+        return {"ok": False, "action": "cancel", "order_id": oid,
+                "error": "order id required"}
+    if engine.manual_cancel_requested(oid):
+        return {"ok": True, "already": True, "action": "cancel",
+                "order_id": oid, "result": {"stCode": 200,
+                                            "note": "cancel already requested"},
+                "cancelled": 0}
+    syn = engine.by_any_id(oid)
+    what = "unknown"
+    if syn:
+        if oid == str(syn.get("entry_order_id")):
+            what = "entry"
+        elif oid == str(syn.get("sl_order_id")):
+            what = "sl"
+        elif oid == str(syn.get("exit_order_id")):
+            what = "exit"
+    try:
+        r = kotak.cancel(oid)
+        ok = _broker_ok(r)
+        err = None if ok else _safe_text(r)
+    except Exception as e:  # noqa: BLE001 - reported as a structured failure
+        r, ok, err = None, False, _safe_text(e)
+    engine.note_manual_cancel(oid, ok, err)
+    if ok and schedule:
+        _request_reconcile("cancel")
+    res = {"ok": bool(ok), "already": False, "action": "cancel",
+           "order_id": oid, "what": what, "result": _safe_result(r),
+           "cancelled": 1 if ok else 0}
+    if not ok:
+        res["error"] = err or "cancel failed"
+        log.error("MANUAL CANCEL failed order=%s symbol=%s: %s", oid,
+                  (syn or {}).get("trading_symbol"), err)
+    return res
+
+
+@router.post("/cancel-all/{symbol}", dependencies=[Depends(require_user)])
+def cancel_all(symbol: str):
+    """Cancel every tracked working entry/SL for one symbol, idempotently."""
+    assert kotak is not None and engine is not None
+    try:
+        res = _run_on_worker(_cancel_all_impl, symbol,
+                             label=f"cancel_all:{symbol}")
+    except HTTPException as e:
+        return JSONResponse(status_code=e.status_code, content={
+            "ok": False, "action": "cancel-all", "symbol": symbol,
+            "results": [], "error": _safe_text(e.detail)})
+    if not res.get("ok"):
+        return JSONResponse(status_code=502, content=res)
+    return res
+
+
+def _cancel_all_impl(symbol: str) -> dict:
+    assert engine is not None
+    sym = str(symbol or "").strip().upper()
+    if not sym:
+        return {"ok": False, "action": "cancel-all", "symbol": sym,
+                "results": [], "error": "symbol required"}
+    ids: list[str] = []
+    seen: set[str] = set()
+    for leg in engine.legs_for_symbol(sym):
+        status = leg.get("status")
+        entry = str(leg.get("entry_order_id") or "")
+        sl = str(leg.get("sl_order_id") or "")
+        # Entry is still working while PENDING_ENTRY (or a partial-fill cancel
+        # is still being retried); the SL is working for any live bracket.
+        if (entry and (status == "PENDING_ENTRY"
+                       or leg.get("entry_cancel_pending"))
+                and entry not in seen):
+            seen.add(entry)
+            ids.append(entry)
+        if (sl and status in ("ACTIVE", "TRAILING", "CLOSING", "ERRORED")
+                and sl not in seen):
+            seen.add(sl)
+            ids.append(sl)
+    results = [_cancel_impl(oid, schedule=False) for oid in ids]
+    if ids:
+        _request_reconcile("cancel-all")
+    cancelled = sum(1 for r in results if r.get("ok") and not r.get("already"))
+    already = sum(1 for r in results if r.get("already"))
+    failed = [r for r in results
+              if not (r.get("ok") or r.get("already"))]
+    ok = not failed
+    out = {"ok": ok, "action": "cancel-all", "symbol": sym,
+           "requested_count": len(ids), "cancelled_count": cancelled,
+           "already_count": already, "failed_count": len(failed),
+           "results": results}
+    if failed:
+        details = "; ".join(
+            f"{r.get('order_id')}: {r.get('error') or 'cancel failed'}"
+            for r in failed)
+        out["error"] = (f"{len(failed)} of {len(results)} cancel(s) failed "
+                        f"for {sym}: {details}")
+    return out
 
 
 @router.post("/exit-position", dependencies=[Depends(require_user)])
@@ -352,12 +631,11 @@ def _exit_position_impl(body: ExitBody):
         log.error("exit-position MKT failed for %s: %s", symbol, e)
         raise HTTPException(status_code=502, detail=f"Exit order failed for {symbol}: {e}")
     t_b1 = _ms()
-    if not (r and r.get("stCode") == 200):
+    if not (r and _broker_ok(r)):
         # Log the full rejection server-side — the UI only shows a summary and
         # the order-feed REJECTED row is the only other trace.
         log.error("exit-position MKT rejected for %s (side=%s qty=%s product=%s): %s",
                   symbol, exit_txn, shares, product, r)
-    if not (r and r.get("stCode") == 200):
         raise HTTPException(status_code=502, detail=f"Exit rejected for {symbol}: {r}")
     return {"symbol": symbol, "exit_side": ("SELL" if exit_txn == "S" else "BUY"),
             "quantity": str(shares), "exchange": exchange, "product": product,
@@ -406,23 +684,84 @@ def _force_exit_impl(body: ForceExitBody, user: str):
 
 @router.post("/modify-sl/{order_id}", dependencies=[Depends(require_user)])
 def modify_sl(order_id: str, trigger: float, quantity: str | None = None):
-    return _run_on_worker(_modify_sl_impl, order_id, trigger, quantity,
-                          label=f"modify_sl:{order_id}")
+    assert kotak is not None and engine is not None
+    try:
+        res = _run_on_worker(_modify_sl_impl, order_id, trigger, quantity,
+                             label=f"modify_sl:{order_id}")
+    except HTTPException as e:
+        return JSONResponse(status_code=e.status_code, content={
+            "ok": False, "action": "modify-sl", "order_id": order_id,
+            "trigger": trigger, "error": _safe_text(e.detail)})
+    if not res.get("ok"):
+        code = 400 if res.get("bad_request") else 502
+        return JSONResponse(status_code=code, content=res)
+    return res
 
 
 def _modify_sl_impl(order_id: str, trigger: float, quantity: str | None):
-    """v3 modify_order requires quantity — taken from the synthetic tracker if omitted.
-    Limit side follows the leg: long legs hold a SELL SL, short legs a BUY SL."""
+    """Manual SL trigger change: quantity comes from the tracker (v3 requires it).
+
+    `sl_modify_pending` is set before the broker call so an in-flight modify can
+    never be fought by an automatic SL re-place. The pending window settles when
+    the feed/book echoes the new trigger (or its deadline expires); a failure
+    clears it and alerts instead of silently reverting the tracker.
+    """
     assert kotak is not None and engine is not None
-    syn = engine.by_any_id(order_id)
-    qty = quantity or (syn["quantity"] if syn else None)
-    if not qty:
-        raise HTTPException(status_code=400, detail="Pass ?quantity= (leg not tracked synthetically)")
-    sl_txn = "B" if (syn and syn.get("side") == "S") else "S"
+    oid = str(order_id).strip()
     try:
-        return _broker_call(kotak.modify_sl, order_id, qty, str(trigger),
+        trig = float(trigger)
+    except (TypeError, ValueError):
+        trig = 0.0
+    if not oid or trig <= 0:
+        return {"ok": False, "action": "modify-sl", "order_id": oid,
+                "trigger": trigger, "bad_request": True,
+                "error": "order_id and a positive trigger required"}
+    syn = engine.by_any_id(oid)
+    if syn is not None and oid != str(syn.get("sl_order_id") or ""):
+        return {"ok": False, "action": "modify-sl", "order_id": oid,
+                "trigger": trig, "bad_request": True,
+                "error": "order is not the tracked SL for this leg"}
+    # Tracker quantity is authoritative; the explicit param is only a fallback
+    # for an order this app does not track.
+    raw_qty = ((syn.get("sl_quantity") or syn.get("quantity")) if syn else None) \
+        or quantity
+    qty = _positive_int_qty(raw_qty)
+    if qty is None:
+        return {"ok": False, "action": "modify-sl", "order_id": oid,
+                "trigger": trig, "bad_request": True,
+                "error": "no valid tracked quantity (positive integer required)"}
+    if syn is not None and syn.get("status") == "TRAILING":
+        try:
+            old_stop = float(syn.get("stop_loss_price"))
+        except (TypeError, ValueError):
+            old_stop = 0.0
+        side = str(syn.get("side") or "B").upper()
+        loosened = (side == "S" and trig > old_stop) or \
+                   (side != "S" and trig < old_stop)
+        if old_stop > 0 and loosened:
+            return {"ok": False, "action": "modify-sl", "order_id": oid,
+                    "trigger": f"{trig:.2f}", "bad_request": True,
+                    "error": ("cannot loosen the SL on a TRAILING leg "
+                              f"(current {old_stop:.2f}); only tighten")}
+    sl_txn = "B" if (syn and syn.get("side") == "S") else "S"
+    engine.begin_sl_modify(oid, trig)
+    try:
+        r = kotak.modify_sl(oid, str(qty), f"{trig:.2f}",
                             transaction_type=sl_txn)
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=502, detail=str(e))
+        ok = _broker_ok(r)
+        err = None if ok else _safe_text(r)
+    except Exception as e:  # noqa: BLE001 - structured failure + alert
+        r, ok, err = None, False, _safe_text(e)
+    engine.finish_sl_modify(oid, ok, err)
+    if ok:
+        _request_reconcile("modify-sl")
+    leg = engine.by_any_id(oid) or {}
+    res = {"ok": bool(ok), "action": "modify-sl", "order_id": oid,
+           "trigger": f"{trig:.2f}", "quantity": str(qty),
+           "result": _safe_result(r),
+           "sl_modify_pending": bool(leg.get("sl_modify_pending"))}
+    if not ok:
+        res["error"] = err or "modify failed"
+        log.error("MANUAL SL MODIFY failed order=%s symbol=%s trigger=%s: %s",
+                  oid, (syn or {}).get("trading_symbol"), trig, err)
+    return res

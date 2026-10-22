@@ -1,6 +1,6 @@
 from pathlib import Path
 
-from pydantic import field_validator
+from pydantic import field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 # Single .env at the repo root (same file docker compose uses), resolved by
@@ -64,6 +64,18 @@ class Settings(BaseSettings):
     # How many times reconcile may re-place a missing/rejected/cancelled SL
     # before marking the leg ERRORED + naked_position. Never duplicate a live SL.
     sl_replace_max_attempts: int = 1
+    # Manual SL modify window (Plan 06 WP5): while a modify is in flight, never
+    # auto-re-place the old stop. Book/feed state wins once it settles/expires.
+    sl_modify_timeout_sec: float = 15.0
+    # Manual SL cancel intent is honoured even if the broker call errors/times
+    # out; reconcile treats a missing SL as intentionally cancelled.
+    sl_cancel_timeout_sec: float = 8.0
+    # A CLOSED leg that still sees a working SL retries the cancel this many
+    # times, then raises a bounded CRITICAL alert (no infinite cancel loop).
+    closed_sl_cancel_max_attempts: int = 3
+    # Caller timeout for UI reads served by the dedicated read worker; a wedged
+    # read never occupies the single-writer mutation worker.
+    orderbook_timeout_sec: float = 8.0
     # Cancel/exit integrity (Plan 06 WP4): confirm the SL is terminal in the
     # order book before firing the market exit. All values are wall-clock.
     exit_confirm_timeout_sec: float = 8.0
@@ -80,7 +92,8 @@ class Settings(BaseSettings):
     worker_stop_timeout_sec: float = 5.0
 
     @field_validator("sl_missing_confirmations", "flat_position_confirmations",
-                     "entry_cancel_max_attempts")
+                     "entry_cancel_max_attempts",
+                     "closed_sl_cancel_max_attempts")
     @classmethod
     def _at_least_one_confirmation(cls, v: int) -> int:
         # A single snapshot/attempt is never enough for these safety gates.
@@ -105,7 +118,9 @@ class Settings(BaseSettings):
 
     @field_validator("sl_guarantee_sec", "exit_confirm_timeout_sec",
                      "exit_confirm_poll_sec", "sl_visibility_grace_sec",
-                     "reconcile_sec", "entry_cancel_retry_sec")
+                     "reconcile_sec", "entry_cancel_retry_sec",
+                     "sl_modify_timeout_sec", "sl_cancel_timeout_sec",
+                     "orderbook_timeout_sec")
     @classmethod
     def _positive_timing(cls, v: float) -> float:
         # A zero/negative timer would make the guarantees fire instantly or
@@ -113,6 +128,18 @@ class Settings(BaseSettings):
         if float(v) <= 0:
             raise ValueError("timing values must be > 0")
         return float(v)
+
+    @model_validator(mode="after")
+    def _modify_window_covers_broker_call(self):
+        # A manual modify must still be pending when the slow broker call
+        # settles, otherwise reconcile re-places the old SL first.
+        margin = 1.0
+        if float(self.sl_modify_timeout_sec) <= (
+                float(self.broker_call_timeout_sec) + margin):
+            raise ValueError(
+                "SL_MODIFY_TIMEOUT_SEC must exceed BROKER_CALL_TIMEOUT_SEC "
+                f"by more than {margin:g}s")
+        return self
 
 
 settings = Settings()

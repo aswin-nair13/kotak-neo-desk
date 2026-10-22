@@ -310,6 +310,12 @@ def test_config_rejects_zero_confirmations_and_timers():
         Settings(exit_confirm_timeout_sec=0)
     with pytest.raises(ValidationError):
         Settings(sl_guarantee_behavior="cancel-everything")
+    with pytest.raises(ValidationError):
+        # The modify window must outlast a slow broker call or reconcile can
+        # re-place the old SL before the modify settles.
+        Settings(sl_modify_timeout_sec=8.0, broker_call_timeout_sec=10.0)
+    assert Settings(sl_modify_timeout_sec=15.0,
+                    broker_call_timeout_sec=10.0).sl_modify_timeout_sec == 15.0
 
 
 def test_fno_position_lots_are_normalized_to_shares(monkeypatch):

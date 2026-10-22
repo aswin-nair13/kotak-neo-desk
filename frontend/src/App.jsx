@@ -104,6 +104,14 @@ export default function App() {
   const [busyKey, setBusyKey] = useState('')
   const [exiting, setExiting] = useState('')
   const [forcing, setForcing] = useState('')
+  // Plan 06 WP6: broker order book (structured, freshness-aware) + per-action
+  // in-flight locks. A failed/stale read is shown as an error, never an empty
+  // table that looks like a flat book.
+  const [book, setBook] = useState({ ok: true, orders: [], count: 0, stale: false })
+  const [bookBusy, setBookBusy] = useState({})
+  // One poll at a time: a slow/wedged read must not stack 5s requests (and the
+  // backend worker read has its own short timeout).
+  const bookLoadingRef = useRef(false)
   // click-to-fill latency: clickRef maps nOrdNo -> { clickMs, brokerMs, symbol };
   // lat maps nOrdNo -> { totalMs, brokerMs } computed when the ws update lands.
   // totalMs uses the browser clock only (no server skew); brokerMs is the
@@ -143,6 +151,24 @@ export default function App() {
 
   const auth = { headers: { Authorization: `Bearer ${token}` } }
   const say = (kind, text) => setMsg({ kind, text })
+
+  const loadOrderbook = async () => {
+    if (bookLoadingRef.current) return
+    bookLoadingRef.current = true
+    try {
+      const r = await api.get('/orders/orderbook', auth)
+      setBook(r.data)
+    } catch (e) {
+      const d = e.response?.data
+      setBook({
+        ok: false, orders: [], count: 0, stale: true,
+        error: d?.error || d?.detail || e.message,
+        fetched_at_ms: d?.fetched_at_ms ?? null,
+      })
+    } finally {
+      bookLoadingRef.current = false
+    }
+  }
 
   /* live socket — index ticks by token AND by symbol (ts) so option legs resolve */
   useEffect(() => {
@@ -227,6 +253,33 @@ export default function App() {
         (r) => setPositions(r.data.positions || {}), () => {})
     }, 30000)
     return () => clearInterval(id)
+  }, [token, kotakIn])
+
+  /* broker order book auto-refresh (Plan 06 WP6) */
+  useEffect(() => {
+    if (!token || !kotakIn) return
+    let live = true
+    const load = async () => {
+      if (bookLoadingRef.current) return
+      bookLoadingRef.current = true
+      try {
+        const r = await api.get('/orders/orderbook', auth)
+        if (live) setBook(r.data)
+      } catch (e) {
+        if (!live) return
+        const d = e.response?.data
+        setBook({
+          ok: false, orders: [], count: 0, stale: true,
+          error: d?.error || d?.detail || e.message,
+          fetched_at_ms: d?.fetched_at_ms ?? null,
+        })
+      } finally {
+        bookLoadingRef.current = false
+      }
+    }
+    load()
+    const id = setInterval(load, 5000)
+    return () => { live = false; clearInterval(id) }
   }, [token, kotakIn])
 
   const spot = useMemo(() => {
@@ -601,6 +654,81 @@ export default function App() {
     }
   }
 
+  /* ---- order management (Plan 06 WP6) ---- */
+  const withBookBusy = async (key, fn) => {
+    setBookBusy((p) => ({ ...p, [key]: true }))
+    try { await fn() } finally {
+      setBookBusy((p) => {
+        const n = { ...p }
+        delete n[key]
+        return n
+      })
+    }
+  }
+
+  const cancelOrder = (o) => withBookBusy(`cancel:${o.nOrdNo}`, async () => {
+    if (!window.confirm(`Cancel order ${o.nOrdNo} (${o.trdSym})?`)) return
+    try {
+      const r = await api.post(`/orders/cancel/${encodeURIComponent(o.nOrdNo)}`, {}, auth)
+      say('ok', r.data.already
+        ? `Cancel ${o.nOrdNo}: already requested`
+        : `Cancel ${o.nOrdNo}: ${r.data.result?.stCode === 200 ? 'accepted' : 'sent'}`)
+      await loadOrderbook()
+      refreshData()
+    } catch (e) {
+      const d = e.response?.data
+      say('err', `Cancel ${o.nOrdNo} failed: ${d?.error || d?.detail || e.message}`)
+      loadOrderbook()
+    }
+  })
+
+  const modifySl = (o) => withBookBusy(`modify:${o.nOrdNo}`, async () => {
+    const leg = synthetic.find((s) =>
+      String(s.sl_order_id) === String(o.nOrdNo)
+      || String(s.entry_order_id) === String(o.nOrdNo))
+    const cur = leg?.stop_loss_price || o.trigger_price || ''
+    const raw = window.prompt(
+      `New SL trigger for ${o.trdSym} (order ${o.nOrdNo}).\nQuantity comes from the tracker.`, cur)
+    if (raw == null) return
+    const trigger = Number(raw)
+    if (!Number.isFinite(trigger) || trigger <= 0) {
+      say('err', 'SL trigger must be a positive number.')
+      return
+    }
+    if (!window.confirm(`Modify SL ${o.nOrdNo} trigger to ${trigger}?`)) return
+    try {
+      const r = await api.post(
+        `/orders/modify-sl/${encodeURIComponent(o.nOrdNo)}?trigger=${encodeURIComponent(trigger)}`,
+        {}, auth)
+      say('ok', `SL ${o.nOrdNo} modify accepted at ${r.data.trigger} — waiting for broker/feed sync.`)
+      await loadOrderbook()
+      refreshData()
+    } catch (e) {
+      const d = e.response?.data
+      say('err', `SL modify failed: ${d?.error || d?.detail || e.message}`)
+      loadOrderbook()
+    }
+  })
+
+  const cancelSymbol = (symbol) => withBookBusy(`cancelall:${symbol}`, async () => {
+    if (!window.confirm(`Cancel every tracked entry/SL for ${symbol}?`)) return
+    try {
+      const r = await api.post(`/orders/cancel-all/${encodeURIComponent(symbol)}`, {}, auth)
+      say('ok', `Cancel-all ${symbol}: ${r.data.cancelled_count}/${r.data.requested_count} sent` +
+        `${r.data.already_count ? `, ${r.data.already_count} already requested` : ''}.`)
+      await loadOrderbook()
+      refreshData()
+    } catch (e) {
+      const d = e.response?.data
+      const failed = (d?.results || []).filter((r) => !(r.ok || r.already))
+      const perId = failed.map((r) =>
+        `${r.order_id}: ${r.error || 'failed'}`).join('; ')
+      say('err', `Cancel-all ${symbol} failed: ${d?.error || d?.detail || e.message}` +
+        (perId ? ` [${perId}]` : ''))
+      loadOrderbook()
+    }
+  })
+
   /* ---- render ---- */
   if (!token) return (
     <div className="page">
@@ -853,13 +981,13 @@ export default function App() {
         <p className="sub">Synthetic SL / target state per entry order. Fill lat = broker accept → exchange fill (server clock).</p>
         {synthetic.length === 0 ? <div className="empty">No working legs.</div> : (
           <table className="tbl"><thead><tr>
-            <th>Symbol</th><th>Side</th><th>Qty</th><th>Target</th><th>Stop</th><th>Strategy</th><th>Status</th><th>Safety</th><th>Fill lat</th>
+            <th>Symbol</th><th>Side</th><th>Qty</th><th>Target</th><th>Stop</th><th>Strategy</th><th>Status</th><th>Safety</th><th>Sync</th><th>Fill lat</th>
           </tr></thead><tbody>
             {synthetic.map((o) => {
               const canForce = o.naked_position || o.exit_ambiguous || [
                 'EXIT_BLOCKED_SL_STILL_WORKING', 'EXIT_REJECTED', 'EXIT_CANCELLED',
                 'EXIT_UNKNOWN', 'EXIT_AMBIGUOUS', 'POSITION_MISMATCH', 'SL_MISSING',
-                'SL_TERMINAL', 'SL_PLACEMENT_REJECTED',
+                'SL_TERMINAL', 'SL_PLACEMENT_REJECTED', 'SL_CANCELLED_MANUAL',
               ].includes(o.blocked_reason)
               return (
                 <tr key={o.entry_order_id}>
@@ -876,6 +1004,11 @@ export default function App() {
                       <span className="st PENDING_ENTRY" title={o.error || o.blocked_reason}>{o.blocked_reason}</span>}
                     {o.blocked_reason === 'EXIT_BLOCKED_SL_STILL_WORKING' &&
                       <span className="st ERRORED" title={o.error || ''}>EXIT BLOCKED</span>}
+                    {o.sl_modify_pending && (
+                      <span className="st PENDING_ENTRY" title={`manual SL modify to ${o.sl_modify_target} in flight`}>
+                        SL MODIFY PENDING
+                      </span>
+                    )}
                     {canForce && (
                       <button className="btn sell sm" style={{ marginLeft: 6 }}
                         disabled={forcing === o.entry_order_id}
@@ -893,6 +1026,15 @@ export default function App() {
                         SL due {new Date(o.sl_guarantee_due_ms).toLocaleTimeString()}
                       </span>
                     )}
+                  </td>
+                  <td className="ltp">
+                    <span title={`last sync source: ${o.source || 'unknown'}`}>
+                      {o.source || '—'}
+                    </span>
+                    <span className="ltp" style={{ marginLeft: 6 }}
+                      title="last synced from feed/book/API">
+                      {o.last_synced_ms ? new Date(o.last_synced_ms).toLocaleTimeString() : '—'}
+                    </span>
                   </td>
                   <td className="ltp">{fmtLat(o.fill_latency_ms) ?? '—'}</td>
                 </tr>
@@ -913,6 +1055,83 @@ export default function App() {
                   onClick={() => exitPosition(s)}>{exiting === s ? 'Exiting…' : 'Exit'}</button></td>
               </tr>
             ))}</tbody></table>
+        )}
+      </div>
+
+      <div className="card">
+        <h2>Broker order book ({book.count || 0})</h2>
+        <p className="sub">
+          Live broker book (auto-refresh 5s). Actions run through the single-writer worker;
+          the tracker is updated and a reconcile is scheduled. A failed/stale read is shown
+          as an error, never as an empty book.
+        </p>
+        {!book.ok && (
+          <p className="msg err">
+            Order book unavailable{book.error ? `: ${book.error}` : ''}
+            {book.fetched_at_ms ? ` (last attempt ${new Date(book.fetched_at_ms).toLocaleTimeString()})` : ''}
+          </p>
+        )}
+        {book.ok && (book.orders || []).length === 0 && (
+          <div className="empty">No working or recent orders in the broker book.</div>
+        )}
+        {book.ok && (book.orders || []).length > 0 && (
+          <table className="tbl"><thead><tr>
+            <th>Order</th><th>Symbol</th><th>Side</th><th>Qty / Filled</th><th>Price</th>
+            <th>Trigger</th><th>Status</th><th>Age</th><th>Actions</th>
+          </tr></thead><tbody>
+            {(book.orders || []).map((o) => {
+              const leg = synthetic.find((s) =>
+                String(s.entry_order_id) === String(o.nOrdNo)
+                || String(s.sl_order_id) === String(o.nOrdNo))
+              const st = String(o.ordSt || '').toLowerCase()
+              const terminal = st.includes('complete') || st.includes('filled')
+                || st.includes('reject') || st.includes('cancel') || st.includes('expir')
+              const busy = bookBusy[`cancel:${o.nOrdNo}`] || bookBusy[`modify:${o.nOrdNo}`]
+              const symBusy = bookBusy[`cancelall:${o.trdSym}`]
+              return (
+                <tr key={o.nOrdNo}>
+                  <td title={o.nOrdNo}>{o.nOrdNo}{leg ? ` (${o.nOrdNo === String(leg.entry_order_id) ? 'entry' : 'SL'})` : ''}</td>
+                  <td>{o.trdSym}</td>
+                  <td className={`side-${o.trnsTp}`}>{o.trnsTp === 'B' ? 'BUY' : o.trnsTp === 'S' ? 'SELL' : o.trnsTp}</td>
+                  <td>{o.qty} / {o.fldQty}</td>
+                  <td>{o.prc}</td>
+                  <td>{o.trigger_price || '—'}</td>
+                  <td><span className={`st ${feedClass(o.ordSt)}`}>{(o.ordSt || '?').toUpperCase()}</span></td>
+                  <td className="ltp" title={o.ord_time ? `broker time ${o.ord_time}` : ''}>
+                    {fmtLat(o.age_ms) ?? '—'}
+                  </td>
+                  <td>
+                    <button className="btn ghost sm" disabled={!o.trdSym || symBusy}
+                      title="Cancel every tracked entry/SL for this symbol"
+                      onClick={() => cancelSymbol(o.trdSym)}>
+                      {symBusy ? '…' : 'Cancel all'}
+                    </button>
+                    {!terminal && (
+                      <button className="btn sell sm" style={{ marginLeft: 6 }}
+                        disabled={busy}
+                        onClick={() => cancelOrder(o)}>
+                        {bookBusy[`cancel:${o.nOrdNo}`] ? '…' : 'Cancel'}
+                      </button>
+                    )}
+                    {!terminal && leg && String(leg.sl_order_id) === String(o.nOrdNo) && (
+                      <button className="btn buy sm" style={{ marginLeft: 6 }}
+                        disabled={busy}
+                        onClick={() => modifySl(o)}>
+                        {bookBusy[`modify:${o.nOrdNo}`] ? '…' : 'Modify SL'}
+                      </button>
+                    )}
+                    {o.trdSym && (
+                      <button className="btn sell sm" style={{ marginLeft: 6 }}
+                        disabled={exiting === o.trdSym}
+                        onClick={() => exitPosition(o.trdSym)}>
+                        {exiting === o.trdSym ? '…' : 'Exit'}
+                      </button>
+                    )}
+                  </td>
+                </tr>
+              )
+            })}
+          </tbody></table>
         )}
       </div>
 
