@@ -1,7 +1,8 @@
 # Remediation Plan Index — KotakAPI Trader Security/Architecture Audit
 
-Status: **DRAFT — not implemented.** These are planning documents only. Do not
-start work without picking a group and confirming scope.
+Status: **Plan 06 IMPLEMENTED** (2026-10-23; commits `3204b8e`..`a439837`).
+The remaining documents are planning references; confirm scope before starting
+new work.
 
 Source: security audit + adversarial review of the backend (`backend/app/*`),
 frontend (`frontend/src/*`), deploy configs, and installed `kotakneoapi` 3.0.7.

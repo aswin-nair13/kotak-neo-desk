@@ -1,6 +1,6 @@
 # Plan 06 — Order-Feed Liveness, SL Guarantee & Exit Integrity
 
-Status: **DRAFT — not implemented.** · Priority: **P0 (trading safety)** · Scope:
+Status: **IMPLEMENTED** (2026-10-23; WP1–WP11, commits `3204b8e`..`a439837`). · Priority: **P0 (trading safety)** · Scope:
 `backend/app/sfeed_bridge.py`, `backend/app/synthetic_engine.py`,
 `backend/app/kotak_client.py`, `backend/app/routes/orders.py`,
 `backend/app/routes/market.py`, `backend/app/main.py`, `frontend/src/App.jsx`,
