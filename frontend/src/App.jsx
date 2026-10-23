@@ -91,6 +91,9 @@ export default function App() {
   const [orders, setOrders] = useState([])
   const [synthetic, setSynthetic] = useState([])
   const [positions, setPositions] = useState({})
+  // Plan 06 WP7: a failed/stale positions read keeps the last good rows and
+  // shows an explicit banner; it is never rendered as a flat account.
+  const [posMeta, setPosMeta] = useState({ ok: true, stale: false, error: '', at: null })
   const [f, setF] = useState(blank)
   const [expiries, setExpiries] = useState([])
   const [strikes, setStrikes] = useState({ ce: [], pe: [], atm: null })
@@ -101,6 +104,8 @@ export default function App() {
   const [legs, setLegs] = useState([])
   // REST fallback LTPs until ws ticks arrive: { symbol: ltp }
   const [px, setPx] = useState({})
+  // A failed batch quote is surfaced as stale/unavailable, never blank or 0.
+  const [pxMeta, setPxMeta] = useState({ stale: false, error: '', at: null })
   const [busyKey, setBusyKey] = useState('')
   const [exiting, setExiting] = useState('')
   const [forcing, setForcing] = useState('')
@@ -151,6 +156,18 @@ export default function App() {
 
   const auth = { headers: { Authorization: `Bearer ${token}` } }
   const say = (kind, text) => setMsg({ kind, text })
+
+  const applyPositions = (r) => {
+    setPositions(r.data.positions || {})
+    setPosMeta({ ok: true, stale: false, error: '', at: Date.now() })
+  }
+  const positionsFailed = (e) => {
+    const d = e?.response?.data
+    setPosMeta((m) => ({
+      ...m, ok: false, stale: true,
+      error: d?.error || d?.detail || e?.message || 'positions unavailable',
+    }))
+  }
 
   const loadOrderbook = async () => {
     if (bookLoadingRef.current) return
@@ -249,8 +266,7 @@ export default function App() {
   useEffect(() => {
     if (!token || !kotakIn) return
     const id = setInterval(() => {
-      api.get('/market/positions', auth).then(
-        (r) => setPositions(r.data.positions || {}), () => {})
+      api.get('/market/positions', auth).then(applyPositions, positionsFailed)
     }, 30000)
     return () => clearInterval(id)
   }, [token, kotakIn])
@@ -338,11 +354,13 @@ export default function App() {
     try {
       const [s, p, st] = await Promise.all([
         api.get('/orders/synthetic', auth),
-        api.get('/market/positions', auth),
+        api.get('/market/positions', auth).then(
+          (r) => { applyPositions(r); return r },
+          (e) => { positionsFailed(e); return null }),
         api.get('/auth/kotak/status', auth),
       ])
       setSynthetic(s.data.orders || [])
-      setPositions(p.data.positions || {})
+      if (p === null) { /* banner already set; keep last good rows */ }
       setKotakIn(!!st.data.logged_in)
       // Scrip master drives the symbol->token map behind every order; when it
       // failed to load the server reports trading_enabled=false and we block entry.
@@ -451,6 +469,7 @@ export default function App() {
     api.post('/market/batch-quotes', body, auth).then((r) => {
       const ltps = r.data.ltps || {}
       setPx((prev) => ({ ...prev, ...ltps }))
+      setPxMeta({ stale: false, error: '', at: Date.now() })
       setLtp((v) => {
         const next = { ...v }
         const ceSym = f.ce_strike ? symOf(f.instrument, f.expiry, f.ce_strike, 'CE') : null
@@ -459,7 +478,13 @@ export default function App() {
         if (peSym && ltps[peSym] != null) next.pe = ltps[peSym]
         return next
       })
-    }).catch(() => {})
+    }).catch((e) => {
+      const d = e?.response?.data
+      setPxMeta((m) => ({
+        ...m, stale: true,
+        error: d?.error || d?.detail || e?.message || 'quotes unavailable',
+      }))
+    })
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [JSON.stringify(legs), f.instrument, f.expiry, kotakIn])
 
@@ -474,7 +499,8 @@ export default function App() {
       setPx((v) => ({ ...v, [sym]: price }))
       return price
     } catch (e) {
-      say('err', `Quote failed (${otype} ${strike}): ${e.response?.data?.detail || e.message}`)
+      const d = e?.response?.data
+      say('err', `Quote failed (${otype} ${strike}): ${d?.error || d?.detail || e.message}`)
       return null
     } finally {
       setQuoting(false)
@@ -614,8 +640,10 @@ export default function App() {
     if (!window.confirm(`Flatten ${symbol} at market and cancel its SL/target?`)) return
     setExiting(symbol)
     const tClick = Date.now()
+    const idemTag = newTag()
     try {
-      const r = await api.post('/orders/exit-position', { symbol }, auth)
+      const r = await api.post('/orders/exit-position',
+        { symbol, client_order_tag: idemTag }, auth)
       const apiMs = Date.now() - tClick
       rememberClick(r.data.exit_order?.nOrdNo, tClick, r.data.timing, r.data.symbol)
       const b = r.data.timing?.broker_rtt_ms
@@ -940,6 +968,12 @@ export default function App() {
       <div className="card">
         <h2>Strike list — instant execution ({legs.length})</h2>
         <p className="sub">Entry/Tgt/Stop/Offset inherit the ticket at add time, then edit per row. L needs its Limit ₹ cell filled; L-1 uses the Offset cell (BUY = LTP−off, SELL = LTP+off). List survives orders and refreshes, clears only on instrument/expiry change.</p>
+        {pxMeta.stale && (
+          <p className="msg err">
+            Watchlist quotes unavailable{pxMeta.error ? `: ${pxMeta.error}` : ''}
+            {pxMeta.at ? ` (last updated ${new Date(pxMeta.at).toLocaleTimeString()})` : ''}
+          </p>
+        )}
         {legs.length === 0 ? <div className="empty">Empty — pick a CE/PE strike above and press “+ list”.</div> : (
           <table className="tbl"><thead><tr>
             <th>Contract</th><th>Live LTP</th><th>Entry</th><th>Tgt</th><th>Stop</th><th>Off</th><th>Limit ₹</th><th>Buy</th><th>Sell</th><th></th>
@@ -950,7 +984,9 @@ export default function App() {
               return (
                 <tr key={l.key}>
                   <td>{sym}</td>
-                  <td className="ltp">{live ?? '…'}</td>
+                  <td className="ltp" title={pxMeta.stale ? pxMeta.error || 'quotes unavailable' : ''}>
+                    {live ?? (pxMeta.stale ? 'unavailable' : '…')}
+                  </td>
                   <td><select className="mini" value={l.entry_mode || 'MKT'}
                     onChange={(e) => updateLeg(l.key, { entry_mode: e.target.value })}>
                     <option>MKT</option><option>ML</option><option>L-1</option><option>L</option>
@@ -1047,7 +1083,15 @@ export default function App() {
       <div className="card">
         <h2>Positions</h2>
         <p className="sub">Net broker positions (auto-refreshes every 30s). Exit flattens at market and cancels that symbol's entry/SL + synthetic target.</p>
-        {Object.keys(positions).length === 0 ? <div className="empty">Flat — no open positions.</div> : (
+        {!posMeta.ok && (
+          <p className="msg err">
+            Positions unavailable{posMeta.error ? `: ${posMeta.error}` : ''}
+            {posMeta.at ? ` (last updated ${new Date(posMeta.at).toLocaleTimeString()})` : ' (no successful snapshot yet)'}
+          </p>
+        )}
+        {Object.keys(positions).length === 0
+          ? (posMeta.ok ? <div className="empty">Flat — no open positions.</div> : null)
+          : (
           <table className="tbl"><thead><tr><th>Symbol</th><th>Qty</th><th>Avg price</th><th></th></tr></thead>
             <tbody>{Object.entries(positions).map(([s, p]) => (
               <tr key={s}><td>{s}</td><td>{p.qty}</td><td>{p.avg_prc}</td>

@@ -116,7 +116,7 @@ class FakeKotak:
         self.book_calls += 1
         return {"data": []}
 
-    def positions(self):
+    def positions(self, strict=False):
         self.position_calls += 1
         return {}
 

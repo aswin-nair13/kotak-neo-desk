@@ -78,12 +78,16 @@ def wired():
     routes.bridge = bridge
     routes.worker = None
     routes.read_worker = None
+    with routes._manual_exit_lock:
+        routes._manual_exit_records.clear()
     yield broker, engine, bridge
     routes.kotak = None
     routes.engine = None
     routes.bridge = None
     routes.worker = None
     routes.read_worker = None
+    with routes._manual_exit_lock:
+        routes._manual_exit_records.clear()
 
 
 def test_orderbook_is_structured_with_trigger_and_age(wired):
@@ -327,7 +331,7 @@ def test_exit_position_rejects_stat_not_ok_even_with_stcode_200(wired):
     from app.schemas import ExitBody
 
     class BadExit:
-        def positions(self):
+        def positions(self, strict=False):
             return {"ABC": {"qty": 1, "qty_shares": 20,
                             "exchange": "nse_fo"}}
 
@@ -345,6 +349,148 @@ def test_exit_position_rejects_stat_not_ok_even_with_stcode_200(wired):
     finally:
         routes.kotak = broker
         routes.engine = engine
+
+
+def test_exit_position_positions_timeout_is_504_not_404(wired):
+    _broker, _engine, _bridge = wired
+    from fastapi import HTTPException
+
+    from app.schemas import ExitBody
+
+    class TimeoutWorker:
+        def submit_wait(self, fn, *args, timeout=None, **kwargs):
+            raise TimeoutError("positions stalled")
+
+    routes.read_worker = TimeoutWorker()
+    try:
+        with pytest.raises(HTTPException) as err:
+            routes.exit_position(ExitBody(symbol="ABC"))
+        assert err.value.status_code == 504
+        assert "No open position" not in str(err.value.detail)
+    finally:
+        routes.read_worker = None
+
+
+def test_exit_position_positions_failure_is_502_not_404(wired):
+    _broker, _engine, _bridge = wired
+    from fastapi import HTTPException
+
+    from app.schemas import ExitBody
+
+    class BrokenPositions:
+        def positions(self, strict=False):
+            raise RuntimeError("positions failed token=supersecret")
+
+    routes.read_worker = None
+    routes.kotak = BrokenPositions()
+    try:
+        with pytest.raises(HTTPException) as err:
+            routes.exit_position(ExitBody(symbol="ABC"))
+        assert err.value.status_code == 502
+        assert "No open position" not in str(err.value.detail)
+        assert "supersecret" not in str(err.value.detail)
+    finally:
+        routes.read_worker = None
+
+
+class ManualExitBroker:
+    def __init__(self, timeout_first=False):
+        self.book = []
+        self.places = []
+        self.timeout_first = timeout_first
+        self.report_error = None
+
+    def positions(self, strict=False):
+        return {"ABC": {"qty": 1, "qty_shares": 20, "exchange": "nse_fo",
+                        "product": "MIS"}}
+
+    def cancel(self, oid):
+        return {"stCode": 200}
+
+    def place_market_exit(self, exchange, qty, symbol, **kwargs):
+        self.places.append({"exchange": exchange, "qty": qty,
+                            "symbol": symbol, **kwargs})
+        oid = f"X{len(self.places)}"
+        self.book.append({"nOrdNo": oid, "ordSt": "open", "trdSym": symbol,
+                          "trnsTp": kwargs.get("transaction_type", "S"),
+                          "qty": qty, "prc": "0", "fldQty": "0",
+                          "GuiOrdId": kwargs.get("tag")})
+        if self.timeout_first and len(self.places) == 1:
+            raise TimeoutError("manual exit response lost after accept")
+        return {"stCode": 200, "nOrdNo": oid}
+
+    def order_report(self):
+        if self.report_error is not None:
+            raise self.report_error
+        return {"stat": "Ok", "stCode": 200, "data": list(self.book)}
+
+
+def test_manual_exit_timeout_landed_is_adopted_and_double_click_is_idempotent(
+        wired):
+    _broker, engine, _bridge = wired
+    from app.schemas import ExitBody
+
+    broker = ManualExitBroker(timeout_first=True)
+    routes.kotak = broker
+    try:
+        out = routes.exit_position(
+            ExitBody(symbol="ABC", client_order_tag="click-1"))
+        assert out["adopted"] is True
+        assert out["exit_order"]["nOrdNo"] == "X1"
+        assert len(broker.places) == 1
+        tag = out["manual_exit_tag"]
+        assert broker.places[0]["tag"] == tag
+        assert engine.manual_exit_tag_record(tag)["state"] == "complete"
+
+        again = routes.exit_position(
+            ExitBody(symbol="ABC", client_order_tag="click-2"))
+        assert again["exit_order"]["nOrdNo"] == "X1"
+        assert len(broker.places) == 1
+    finally:
+        routes.kotak = None
+
+
+def test_manual_exit_double_click_cannot_double_exit(wired):
+    _broker, _engine, _bridge = wired
+    from app.schemas import ExitBody
+
+    broker = ManualExitBroker()
+    routes.kotak = broker
+    try:
+        first = routes.exit_position(ExitBody(symbol="ABC"))
+        second = routes.exit_position(ExitBody(symbol="ABC"))
+        assert first["exit_order"]["nOrdNo"] == "X1"
+        assert second["exit_order"]["nOrdNo"] == "X1"
+        assert len(broker.places) == 1
+    finally:
+        routes.kotak = None
+
+
+def test_manual_exit_ambiguous_is_not_replaced_on_retry(wired, monkeypatch):
+    _broker, _engine, _bridge = wired
+    from fastapi import HTTPException
+
+    from app.schemas import ExitBody
+
+    monkeypatch.setattr(settings, "order_place_confirm_sec", 0)
+    broker = ManualExitBroker(timeout_first=True)
+    broker.order_report = lambda: {"stat": "Ok", "stCode": 200, "data": []}
+    routes.kotak = broker
+    try:
+        with pytest.raises(HTTPException) as first:
+            routes.exit_position(ExitBody(symbol="ABC",
+                                          client_order_tag="click-1"))
+        assert first.value.status_code == 502
+        assert len(broker.places) == 1
+
+        with pytest.raises(HTTPException) as again:
+            routes.exit_position(ExitBody(symbol="ABC",
+                                          client_order_tag="click-2"))
+        assert again.value.status_code == 502
+        assert "no duplicate" in str(again.value.detail)
+        assert len(broker.places) == 1
+    finally:
+        routes.kotak = None
 
 
 def test_cancel_all_partial_failure_returns_top_level_error(wired):
@@ -401,7 +547,7 @@ def test_positions_read_uses_dedicated_read_worker_and_times_out(wired):
     seen = {}
 
     class PositionsBroker:
-        def positions(self):
+        def positions(self, strict=False):
             seen["thread"] = threading.current_thread().name
             return {"X": {"qty": 20}}
 

@@ -1,9 +1,12 @@
+import time
+
 from fastapi import APIRouter, Depends, HTTPException
+from fastapi.responses import JSONResponse
 
 from ..auth import require_user
 from ..broker_worker import WorkerQueueFull
 from ..config import settings
-from ..kotak_client import KotakService
+from ..kotak_client import BrokerDataError, KotakService, sanitize_error_text
 from ..schemas import WatchBody
 
 router = APIRouter()
@@ -14,6 +17,64 @@ read_worker = None  # dedicated CommandWorker for read-only broker calls
 
 def _step(instrument: str) -> int:
     return 100 if instrument == "SENSEX" else 50
+
+
+def _ms() -> int:
+    return int(time.time() * 1000)
+
+
+def _market_error(message, **extra) -> JSONResponse:
+    """Structured 502: never a 200 with an empty/last-good-looking payload."""
+    body = {"ok": False, "stale": True, "source": "broker",
+            "error": sanitize_error_text(message), "fetched_at_ms": _ms()}
+    body.update(extra)
+    return JSONResponse(status_code=502, content=body)
+
+
+def _positions_impl():
+    """Worker-side strict positions read (raises BrokerDataError on failure)."""
+    assert kotak is not None
+    return kotak.positions(strict=True)
+
+
+def _read_call(fn, *args, label: str, timeout: float | None = None, **kwargs):
+    """Run a market-data read on the dedicated worker (or inline in tests).
+
+    Timeout/backlog map to 504/503; broker/data failures are left to the caller
+    so it can return a structured 502 instead of an empty-looking 200.
+    """
+    if read_worker is None:
+        return fn(*args, **kwargs)
+    wait = (max(0.1, float(settings.orderbook_timeout_sec))
+            if timeout is None else timeout)
+    try:
+        return read_worker.submit_wait(
+            fn, *args, label=label, timeout=wait, **kwargs)
+    except TimeoutError as e:
+        raise HTTPException(status_code=504,
+                            detail=f"Broker read timed out: {e}") from e
+    except WorkerQueueFull as e:
+        raise HTTPException(status_code=503,
+                            detail=f"Broker read queue full: {e}") from e
+
+
+def _batch_quotes_impl(body: WatchBody):
+    """Worker-side batch quote read: (ltps, per-symbol errors)."""
+    assert kotak is not None
+    out: dict[str, float | None] = {}
+    errors: dict[str, str] = {}
+    for leg in body.legs:
+        symbol = f"{leg.instrument}{leg.expiry}{leg.strike}{leg.option_type}"
+        exchange = "bse_fo" if leg.instrument == "SENSEX" else "nse_fo"
+        try:
+            out[symbol] = kotak.quote_ltp(symbol, exchange, strict=True)
+        except BrokerDataError as e:
+            out[symbol] = None
+            errors[symbol] = sanitize_error_text(e)
+        except Exception as e:  # noqa: BLE001 - surfaced as a structured failure
+            out[symbol] = None
+            errors[symbol] = sanitize_error_text(e)
+    return out, errors
 
 
 def _atm_filter(strikes: list[str], spot: float, step: int, width: int = 10) -> tuple[list[str], int | None]:
@@ -67,10 +128,17 @@ def quote(instrument: str = "NIFTY", expiry: str = "", strike: str = "",
         raise HTTPException(status_code=400, detail="expiry + strike required")
     symbol = f"{instrument}{expiry}{strike}{option_type}"
     exchange = "bse_fo" if instrument == "SENSEX" else "nse_fo"
-    ltp = kotak.quote_ltp(symbol, exchange)
-    if ltp is None:
-        raise HTTPException(status_code=502, detail=f"No quote for {symbol}")
-    return {"symbol": symbol, "ltp": ltp, "token": kotak.token_for(symbol, exchange)}
+    try:
+        ltp = _read_call(kotak.quote_ltp, symbol, exchange, strict=True,
+                         label=f"quote:{symbol}")
+    except HTTPException:
+        raise
+    except BrokerDataError as e:
+        return _market_error(e, symbol=symbol, ltp=None)
+    except Exception as e:  # noqa: BLE001 - surfaced as a structured failure
+        return _market_error(e, symbol=symbol, ltp=None)
+    return {"symbol": symbol, "ltp": ltp, "token": kotak.token_for(symbol, exchange),
+            "ok": True, "stale": False, "fetched_at_ms": _ms()}
 
 
 @router.post("/watch", dependencies=[Depends(require_user)])
@@ -94,32 +162,39 @@ def watch(body: WatchBody):
 
 @router.post("/batch-quotes", dependencies=[Depends(require_user)])
 def batch_quotes(body: WatchBody):
-    """REST fallback for watchlist LTPs (used until ws ticks arrive)."""
+    """REST fallback for watchlist LTPs (used until ws ticks arrive).
+
+    Any failed leg makes the whole response a structured 502. The UI keeps its
+    previous prices and marks them stale; it never renders a failed quote as 0.
+    """
     assert kotak is not None
-    out: dict[str, float | None] = {}
-    for leg in body.legs:
-        symbol = f"{leg.instrument}{leg.expiry}{leg.strike}{leg.option_type}"
-        exchange = "bse_fo" if leg.instrument == "SENSEX" else "nse_fo"
-        try:
-            out[symbol] = kotak.quote_ltp(symbol, exchange)
-        except Exception:
-            out[symbol] = None
-    return {"ltps": out}
+    try:
+        out, errors = _read_call(_batch_quotes_impl, body, label="batch-quotes")
+    except HTTPException:
+        raise
+    except Exception as e:  # noqa: BLE001 - structured failure, never partial 200
+        return _market_error(e, ltps={})
+    if errors:
+        first = next(iter(errors.values()))
+        return _market_error(first, ltps=out, errors=errors)
+    return {"ltps": out, "ok": True, "stale": False, "fetched_at_ms": _ms()}
 
 
 @router.get("/positions", dependencies=[Depends(require_user)])
 def positions():
+    """Net positions, or a structured 502 when the broker read fails.
+
+    A failed/timed-out call is never returned as `200 {positions:{}}` (which
+    would look like a flat account). The UI keeps its last good snapshot and
+    shows an unavailable/stale banner with its timestamp.
+    """
     assert kotak is not None
-    if read_worker is None:
-        return {"positions": kotak.positions()}
     try:
-        data = read_worker.submit_wait(
-            kotak.positions, label="positions",
-            timeout=max(0.1, float(settings.orderbook_timeout_sec)))
-    except TimeoutError as e:
-        raise HTTPException(status_code=504, detail=f"Broker read timed out: {e}")
-    except WorkerQueueFull as e:
-        raise HTTPException(status_code=503, detail=f"Broker read queue full: {e}")
+        data = _read_call(_positions_impl, label="positions")
+    except HTTPException:
+        raise
+    except Exception as e:  # noqa: BLE001 - structured failure, never {}
+        return _market_error(e, positions={})
     return {"positions": data}
 
 

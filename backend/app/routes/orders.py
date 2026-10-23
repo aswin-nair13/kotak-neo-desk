@@ -1,9 +1,10 @@
 """Order endpoints: single leg, straddle (CE+PE), cancel/modify, synthetic list, orderbook."""
 
+import copy
 import logging
-import re
 import threading
 import time
+import uuid
 from datetime import datetime
 
 from fastapi import APIRouter, Depends, HTTPException
@@ -12,7 +13,7 @@ from fastapi.responses import JSONResponse
 from ..auth import require_user
 from ..broker_worker import WorkerQueueFull
 from ..config import settings
-from ..kotak_client import KotakService
+from ..kotak_client import KotakService, sanitize_error_text
 from ..schemas import ExitBody, ForceExitBody, SingleOrderBody, StraddleBody
 from ..sfeed_bridge import map_book_entry, parse_order_book
 from ..synthetic_engine import SyntheticEngine
@@ -32,19 +33,21 @@ worker = None  # CommandWorker, wired in main.py (None in unit tests -> direct)
 read_worker = None  # dedicated CommandWorker, wired in main.py
 
 
-def _run_on_worker(fn, *args, label: str | None = None, **kwargs):
+def _run_on_worker(fn, *args, label: str | None = None,
+                   timeout: float | None = None, **kwargs):
     """Run a route-side mutation on the single writer and map backlog errors.
 
     Place (broker call + engine.add) and exit (cancel + mark + market order)
     must be one worker command, otherwise an order update can be processed
-    between the broker call and the engine registration.
+    between the broker call and the engine registration. `timeout` covers the
+    whole bounded command so a client timeout cannot race an internal retry.
     """
     if worker is None:
         return fn(*args, **kwargs)
     try:
         return worker.submit_wait(
             fn, *args, label=label or getattr(fn, "__name__", "command"),
-            **kwargs)
+            timeout=timeout, **kwargs)
     except TimeoutError as e:
         raise HTTPException(status_code=504, detail=f"Broker command timed out: {e}")
     except WorkerQueueFull as e:
@@ -72,7 +75,7 @@ def _broker_call(fn, *args, label: str | None = None, **kwargs):
     """Run a broker call on the single command worker when it is wired."""
     return _run_on_worker(fn, *args, label=label, **kwargs)
 
-# M5 — server-side idempotency. The UI sends a per-click `client_order_tag`;
+# M5 - server-side idempotency. The UI sends a per-click `client_order_tag`;
 # a duplicate (double-click / retry) with the same tag within the TTL returns
 # the original response instead of placing a second order. The lock makes the
 # check-and-place atomic so two concurrent identical requests can't both reach
@@ -106,6 +109,78 @@ def _idem_store(tag: str | None, resp: dict):
     _idem_cache[tag] = (now, resp)
 
 
+# Manual Exit-button flatten: there is no tracker to attach the broker order to,
+# so an in-memory symbol-level record carries the deterministic broker tag across
+# retries/double-clicks. Pending records live longer than completed ones because
+# an ambiguous exit may need a later order-report adoption; completed records are
+# only cached long enough to swallow a double-click.
+MANUAL_EXIT_PENDING_TTL_SEC = 120.0
+MANUAL_EXIT_DONE_TTL_SEC = 15.0
+_manual_exit_lock = threading.Lock()
+_manual_exit_records: dict[str, dict] = {}
+
+
+def _manual_exit_ttl(rec: dict) -> float:
+    return (MANUAL_EXIT_PENDING_TTL_SEC
+            if rec.get("state") in ("pending", "ambiguous")
+            else MANUAL_EXIT_DONE_TTL_SEC)
+
+
+def _manual_exit_prune_locked(now: float):
+    for symbol, rec in list(_manual_exit_records.items()):
+        if now - float(rec.get("updated_at") or now) >= _manual_exit_ttl(rec):
+            _manual_exit_records.pop(symbol, None)
+
+
+def _manual_exit_get(symbol: str) -> dict | None:
+    now = time.time()
+    with _manual_exit_lock:
+        _manual_exit_prune_locked(now)
+        rec = _manual_exit_records.get(symbol)
+        return copy.deepcopy(rec) if rec is not None else None
+
+
+def _manual_exit_claim(symbol: str, tag: str, client_tag: str | None):
+    now = time.time()
+    with _manual_exit_lock:
+        _manual_exit_prune_locked(now)
+        existing = _manual_exit_records.get(symbol)
+        if existing is not None:
+            return copy.deepcopy(existing), False
+        rec = {"symbol": symbol, "tag": tag, "client_tag": client_tag,
+               "state": "pending", "response": None, "base": None,
+               "created_at": now, "updated_at": now}
+        _manual_exit_records[symbol] = rec
+        return copy.deepcopy(rec), True
+
+
+def _manual_exit_update(symbol: str, tag: str, **fields):
+    with _manual_exit_lock:
+        rec = _manual_exit_records.get(symbol)
+        if rec is None or rec.get("tag") != tag:
+            return
+        rec.update(fields)
+        rec["updated_at"] = time.time()
+
+
+def _manual_exit_drop(symbol: str, tag: str):
+    with _manual_exit_lock:
+        rec = _manual_exit_records.get(symbol)
+        if rec is not None and rec.get("tag") == tag:
+            _manual_exit_records.pop(symbol, None)
+
+
+def _call_place_with_tag(fn, *args, tag: str, **kwargs):
+    """Pass the broker tag, tolerating legacy test doubles without it."""
+    try:
+        return _broker_call(fn, *args, tag=tag, **kwargs)
+    except TypeError as e:
+        if "tag" not in str(e):
+            raise
+        return _broker_call(fn, *args, **kwargs)
+
+
+
 def _lot(instrument: str) -> int:
     return settings.sensex_lot if instrument == "SENSEX" else settings.nifty_lot
 
@@ -132,7 +207,7 @@ def _require_master():
     if not kotak.master_ok:
         raise HTTPException(
             status_code=503,
-            detail="Scrip master unavailable — trading disabled. Refresh the Kotak "
+            detail="Scrip master unavailable - trading disabled. Refresh the Kotak "
                    "session so the scrip-master download succeeds before placing orders.")
 
 
@@ -140,10 +215,10 @@ def _leg(instrument, expiry, option_type, strike, lots, mode, ref_ltp, entry_off
          offset: float = 1.0, limit_price: float | None = None):
     """Derive the entry limit price. Entry modes, symmetric by side
     (is_long True for BUY, False for SELL/short), with ref = live LTP:
-      MKT : marketable limit — BUY ref+5, SELL ref-5 (true MKT is rejected
+      MKT : marketable limit - BUY ref+5, SELL ref-5 (true MKT is rejected
             for some F&O legs, so we fake it with a through-the-market limit)
       ML  : limit at ref (both sides)
-      L-1 : passive limit with configurable offset —
+      L-1 : passive limit with configurable offset -
             BUY ref-offset (bid below), SELL ref+offset (offer above)
       L   : explicit limit_price from the UI Limit column (both sides);
             400 if missing/invalid. Legacy entry_offset fallback kept so old
@@ -188,16 +263,28 @@ def _ms() -> int:
     return int(time.time() * 1000)
 
 
-_SECRET_RE = re.compile(
-    r"(?i)\b(token|sid|rid|authorization|bearer|session|password)\b"
-    r"\s*[=:]?\s*[A-Za-z0-9._\-]+")
-
-
 def _safe_text(value, limit: int = 200) -> str:
     """One-line, credential-redacted broker text for API/log surfaces."""
-    s = str(value or "").replace("\n", " ").replace("\r", " ")
-    s = _SECRET_RE.sub(lambda m: f"{m.group(1)}=<redacted>", s)
-    return s[:limit]
+    return sanitize_error_text(value, limit)
+
+
+def _place_wait_sec() -> float:
+    """HTTP wait covering the whole bounded place/adopt/retry flow.
+
+    Worst case per ambiguous attempt is: one SDK place call (bounded by
+    `BROKER_CALL_TIMEOUT_SEC`) + one order-report read (same SDK transport
+    timeout) + the full `ORDER_PLACE_CONFIRM_SEC` window. A retry adds a second
+    such attempt. The margin absorbs scheduling/queue latency. Waiting only the
+    default broker timeout would let the caller see 504 while the worker is still
+    placing/checking attempt 2, and a manual retry could then duplicate it. The
+    request therefore waits for the bounded worst case.
+    """
+    call = max(0.0, float(settings.broker_call_timeout_sec))
+    confirm = max(0.0, float(settings.order_place_confirm_sec))
+    attempts = max(1, int(settings.order_place_max_attempts))
+    per_attempt = 2.0 * call + confirm
+    return max(call, attempts * per_attempt + 5.0)
+
 
 
 def _broker_ok(res) -> bool:
@@ -308,6 +395,131 @@ def _orderbook_impl():
             "stale": False, "source": "broker"}
 
 
+def _entry_ref() -> str:
+    return uuid.uuid4().hex[:10]
+
+
+def _book_rows_for_tag():
+    """Fresh broker order report rows for timeout adoption: (rows, authoritative)."""
+    assert kotak is not None
+    fn = getattr(kotak, "order_report", None)
+    if not callable(fn):
+        fn = getattr(kotak, "order_book", None)
+    if not callable(fn):
+        return [], False
+    try:
+        raw = fn()
+    except Exception as e:  # noqa: BLE001 - uncertain placement is handled by caller
+        log.error("entry tag lookup failed: %s", _safe_text(e))
+        return [], False
+    rows, ok = parse_order_book(raw)
+    if not ok:
+        return [], False
+    return [m for m in (map_book_entry(r) for r in rows) if m], True
+
+
+def _order_tag(row: dict) -> str:
+    for key in ("guiOrdId", "GuiOrdId", "tag"):
+        value = row.get(key)
+        if value not in (None, ""):
+            return str(value)
+    return ""
+
+
+def _same_side(row_side, side: str) -> bool:
+    got = str(row_side or "").upper()
+    if not got:
+        return False
+    wanted = str(side or "").upper()
+    aliases = {"B": {"B", "BUY"}, "S": {"S", "SELL"}}
+    return got in aliases.get(wanted, {wanted})
+
+
+def _fallback_match(row: dict, symbol: str, qty: str, side: str) -> bool:
+    sym = str(row.get("trdSym") or "").strip()
+    if symbol and sym and sym.upper() != str(symbol).strip().upper():
+        return False
+    row_qty = str(row.get("qty") or "").strip()
+    if qty and row_qty:
+        try:
+            if float(row_qty) != float(qty):
+                return False
+        except (TypeError, ValueError):
+            return False
+    return _same_side(row.get("trnsTp"), side)
+
+
+def _lookup_entry_once(tag: str, symbol: str, qty: str, side: str):
+    """One order-report lookup.
+
+    A tag match is ours and is NOT gated on symbol/qty/side. Symbol/qty/side is
+    only a fallback for rows whose broker tag is missing, and only a unique
+    match may be adopted. Returns (row|None, authoritative, reason, matches).
+    """
+    rows, ok = _book_rows_for_tag()
+    if not ok:
+        return None, False, "book_unavailable", []
+    tagged = [r for r in rows if _order_tag(r)]
+    exact = [r for r in tagged if _order_tag(r) == str(tag)]
+    if len(exact) == 1:
+        return exact[0], True, "tag", exact
+    if len(exact) > 1:
+        return None, True, "ambiguous_tag", exact
+    untagged = [r for r in rows if not _order_tag(r)]
+    fallback = [r for r in untagged if _fallback_match(r, symbol, qty, side)]
+    if len(fallback) == 1:
+        return fallback[0], True, "fallback", fallback
+    if len(fallback) > 1:
+        return None, True, "ambiguous_fallback", fallback
+    return None, True, "absent", []
+
+
+def _find_entry_confirmed(tag: str, symbol: str, qty: str, side: str):
+    """Look up a tag over a short bounded window (book lag after accept).
+
+    Runs only on the ambiguous placement path. The window is deliberately
+    short/bounded; it does not poll forever and does not run on every order.
+    """
+    budget = max(0.0, float(settings.order_place_confirm_sec))
+    deadline = time.monotonic() + budget
+    while True:
+        row, ok, reason, matches = _lookup_entry_once(tag, symbol, qty, side)
+        if row is not None or not ok or reason.startswith("ambiguous"):
+            return row, ok, reason, matches
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return row, ok, reason, matches
+        time.sleep(min(0.2, remaining))
+
+
+def _manual_exit_lookup_once(tag: str):
+    """Exact manual-exit tag lookup: (row|None, authoritative, reason, matches)."""
+    rows, ok = _book_rows_for_tag()
+    if not ok:
+        return None, False, "book_unavailable", []
+    exact = [r for r in rows if _order_tag(r) == str(tag)]
+    if len(exact) == 1:
+        return exact[0], True, "tag", exact
+    if len(exact) > 1:
+        return None, True, "ambiguous_tag", exact
+    return None, True, "absent", []
+
+
+def _find_manual_exit_confirmed(tag: str):
+    """Bounded tag lookup for a manual exit whose placement response was lost."""
+    budget = max(0.0, float(settings.order_place_confirm_sec))
+    deadline = time.monotonic() + budget
+    while True:
+        row, ok, reason, matches = _manual_exit_lookup_once(tag)
+        if row is not None or not ok or reason.startswith("ambiguous"):
+            return row, ok, reason, matches
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return row, ok, reason, matches
+        time.sleep(min(0.2, remaining))
+
+
+
 def _place_tracked(exchange, symbol, qty, entry, body_target, body_stop, strategy, trail, product,
                    side: str = "B", t_recv_ms: int | None = None, tag: str | None = None):
     """Place entry as plain Limit; SL/target/trailing are managed synthetically by the engine.
@@ -316,38 +528,164 @@ def _place_tracked(exchange, symbol, qty, entry, body_target, body_stop, strateg
     Planned target/stop are side-aware; the engine recomputes them from the
     actual fill price when the entry completes (prevents 'STOP PRICE IS NOT
     REASONABLE' when the fill differs from ref_ltp+5).
-    Timing is 3x time.time() calls (~µs) — negligible overhead, used for the
+
+    Plan 06 WP8: a deterministic entry tag is pre-registered as an intent BEFORE
+    the broker call. A timeout/uncertain result is resolved by querying the order
+    report for that tag over a short bounded window (adopt, never duplicate). An
+    exact tag match ignores symbol/qty/side; untagged rows may be adopted only
+    via a unique symbol/qty/side fallback; multiple matches are alerted and never
+    adopted arbitrarily. Only an authoritative miss may trigger one retry
+    (`ORDER_PLACE_MAX_ATTEMPTS`). Every attempt tag is retained: a superseded
+    attempt that lands late is still adopted and flagged DUPLICATE_ENTRY. If the
+    book is unavailable the intent stays pending and no retry is sent. The whole
+    flow runs inside one worker command; the route wait covers its bounded worst
+    case so a client timeout cannot race a second attempt.
+    Timing is 3x time.time() calls (microseconds) - negligible overhead, used for the
     click-to-fill latency display."""
     assert kotak is not None and engine is not None
     side = "S" if str(side).upper() == "S" else "B"
     t_recv_ms = t_recv_ms if t_recv_ms is not None else _ms()
     kw = dict(exchange_segment=exchange, quantity=qty, trading_symbol=symbol,
               transaction_type=side, product=product, order_type="L", price=entry)
-    if tag:
-        kw["tag"] = tag  # echoed by the broker as GuiOrdId; M5 dedupe marker
-    t_b0 = _ms()
-    # Runs inside one _run_on_worker command together with engine.add below.
-    r = kotak.place_order(**kw)
-    t_b1 = _ms()
-    if not (r and _broker_ok(r)):
-        raise HTTPException(status_code=502, detail=f"Entry rejected for {symbol}: {r}")
-    entry_id = r.get("nOrdNo")
-    log.info("entry order placed symbol=%s order=%s side=%s qty=%s",
-             symbol, entry_id, side, qty)
     if side == "S":
         target = max(0.05, float(entry) - float(body_target))
         stop = float(entry) + float(body_stop)
     else:
         target = float(entry) + float(body_target)
         stop = max(0.05, float(entry) - float(body_stop))
-    token = str(kotak.token_for(symbol, exchange))
-    engine.add({"entry_order_id": entry_id, "sl_order_id": None, "trading_symbol": symbol,
-                "status": "PENDING_ENTRY", "strategy": strategy, "target_price": str(round(target, 2)),
-                "stop_loss_price": str(round(stop, 2)), "trail_distance": trail, "high_water_mark": 0.0,
-                "low_water_mark": 0.0, "quantity": qty, "exchange_segment": exchange,
-                "instrument_token": token, "side": side, "product": product,
-                "target_points": str(body_target), "stop_points": str(body_stop),
-                "api_recv_ms": t_recv_ms, "placed_at_ms": t_b1, "broker_rtt_ms": t_b1 - t_b0})
+    token = (str(kotak.token_for(symbol, exchange))
+             if callable(getattr(kotak, "token_for", None)) else "")
+    payload = {
+        "sl_order_id": None, "trading_symbol": symbol, "status": "PENDING_ENTRY",
+        "strategy": strategy, "target_price": str(round(target, 2)),
+        "stop_loss_price": str(round(stop, 2)), "trail_distance": trail,
+        "high_water_mark": 0.0, "low_water_mark": 0.0, "quantity": qty,
+        "exchange_segment": exchange, "instrument_token": token, "side": side,
+        "product": product, "target_points": str(body_target),
+        "stop_points": str(body_stop), "api_recv_ms": t_recv_ms,
+    }
+    if tag:
+        payload["client_order_tag"] = tag   # UI idempotency key, not the broker tag
+    ref = _entry_ref()
+    max_attempts = max(1, int(settings.order_place_max_attempts))
+    entry_id = None
+    chosen_tag = None
+    t_b0 = t_b1 = _ms()
+    adopted = False
+    last_error = None
+    for attempt in range(1, max_attempts + 1):
+        payload["_entry_ref"] = ref
+        payload["_attempt"] = attempt
+        chosen_tag = SyntheticEngine.make_tag("E", ref, attempt)
+        payload["entry_client_tag"] = chosen_tag
+        payload["tag"] = chosen_tag
+        registered = False
+        for _ in range(4):
+            if engine.register_entry_intent(chosen_tag, payload):
+                registered = True
+                break
+            # Tag collision (another attempt/tracker owns this value): never
+            # reuse it; re-roll the reference and try again.
+            ref = _entry_ref()
+            payload["_entry_ref"] = ref
+            chosen_tag = SyntheticEngine.make_tag("E", ref, attempt)
+            payload["entry_client_tag"] = chosen_tag
+            payload["tag"] = chosen_tag
+        if not registered:
+            raise HTTPException(
+                status_code=500,
+                detail=f"Could not allocate a unique entry tag for {symbol}")
+        kw["tag"] = chosen_tag
+        t_b0 = _ms()
+        r = None
+        try:
+            r = kotak.place_order(**kw)
+            t_b1 = _ms()
+        except Exception as e:  # noqa: BLE001 - timeout/reset => uncertain placement
+            t_b1 = _ms()
+            last_error = _safe_text(e)
+            log.error("ENTRY PLACE ambiguous %s tag=%s: %s", symbol, chosen_tag,
+                      last_error)
+        if r is not None:
+            if not _broker_ok(r):
+                engine.abandon_entry_intent(chosen_tag, "broker rejected")
+                raise HTTPException(status_code=502,
+                                    detail=f"Entry rejected for {symbol}: {_safe_text(r)}")
+            oid = (r.get("nOrdNo") if isinstance(r, dict) else None)
+            if oid:
+                entry_id = str(oid)
+                break
+            last_error = "broker accepted the entry without an order id"
+        # Uncertain result: the order may already be live. The lookup ignores
+        # symbol/qty/side for an exact tag match, uses them only for untagged
+        # rows, and never adopts arbitrarily when multiple rows match.
+        found, book_ok, reason, matches = _find_entry_confirmed(
+            chosen_tag, symbol, qty, side)
+        if reason in ("ambiguous_tag", "ambiguous_fallback"):
+            engine.mark_entry_ambiguous(chosen_tag, reason)
+            log.critical("ENTRY AMBIGUOUS %s tag=%s: %d order(s) match (%s) - "
+                         "no adoption/retry; MANUAL ACTION REQUIRED",
+                         symbol, chosen_tag, len(matches), reason)
+            raise HTTPException(
+                status_code=502,
+                detail=(f"Entry placement ambiguous for {symbol}: "
+                        f"{len(matches)} broker order(s) match {chosen_tag}; "
+                        "no retry was sent. Check the order book manually."))
+        if found is not None:
+            found_id = str(found.get("nOrdNo") or "")
+            found_st = str(found.get("ordSt") or "").lower()
+            if "reject" in found_st:
+                engine.abandon_entry_intent(chosen_tag, f"order report: {found_st}")
+                raise HTTPException(status_code=502,
+                                    detail=f"Entry rejected for {symbol}: {found_st}")
+            if found_id:
+                entry_id = found_id
+                adopted = True
+                if reason == "fallback":
+                    log.warning("ENTRY AMBIGUOUS adopted by unique "
+                                "symbol/qty/side (tag missing) %s -> order %s",
+                                chosen_tag, entry_id)
+                else:
+                    log.warning("ENTRY AMBIGUOUS adopted by tag %s -> order %s "
+                                "(%s)", chosen_tag, entry_id, symbol)
+                break
+        if not book_ok:
+            # Cannot prove the order was not accepted: keep the intent pending
+            # so a later reconcile/feed frame can adopt it. Never retry blind.
+            raise HTTPException(
+                status_code=502,
+                detail=(f"Entry placement uncertain for {symbol}: "
+                        f"{last_error or 'no order id'} (order book unavailable; "
+                        "no automatic retry)"))
+        # Authoritative miss over the bounded confirmation window. Keep the tag
+        # as superseded (never discard): if it lands late it is adopted with a
+        # DUPLICATE_ENTRY alert. Only then may the bounded retry fire.
+        engine.supersede_entry_intent(
+            chosen_tag, "authoritative tag miss",
+            superseded_by=(SyntheticEngine.make_tag("E", ref, attempt + 1)
+                           if attempt < max_attempts else None))
+        if attempt < max_attempts:
+            log.warning("ENTRY PLACE RETRY %s tag=%s (attempt %d/%d) after "
+                        "authoritative tag miss", symbol, chosen_tag, attempt,
+                        max_attempts)
+            continue
+        break
+    if entry_id is None:
+        raise HTTPException(
+            status_code=502,
+            detail=(f"Entry placement failed for {symbol} after {max_attempts} "
+                    f"attempt(s): {last_error or 'no broker order id'}"))
+    tracker = engine.commit_entry(chosen_tag, entry_id)
+    if tracker is None:
+        tracker = engine.by_entry_tag(chosen_tag)
+    if tracker is None:
+        # Only reachable if the feed adopted the tag under a different id; fall
+        # back to a direct registration so the position is never unmanaged.
+        payload["entry_order_id"] = entry_id
+        engine.add(payload)
+    log.info("entry order placed symbol=%s order=%s side=%s qty=%s tag=%s%s",
+             symbol, entry_id, side, qty, chosen_tag,
+             " (adopted by tag)" if adopted else "")
     # stream this leg's ticks so target/trailing can fire
     try:
         if bridge is not None:
@@ -355,7 +693,7 @@ def _place_tracked(exchange, symbol, qty, entry, body_target, body_stop, strateg
     except Exception:
         pass
     return {"entry_order_id": entry_id, "symbol": symbol, "entry": entry,
-            "target": target, "stop": stop,
+            "target": target, "stop": stop, "client_tag": chosen_tag,
             "timing": {"server_recv_ms": t_recv_ms, "broker_rtt_ms": t_b1 - t_b0,
                        "server_total_ms": _ms() - t_recv_ms, "placed_at_ms": t_b1}}
 
@@ -380,7 +718,8 @@ def place_single(body: SingleOrderBody, ref_ltp: float = 0):
         result = _run_on_worker(
             _place_tracked, ex, sym, qty, entry, body.target_points, body.stop_points,
             body.strategy, body.trail_distance, body.product, body.side,
-            t_recv, tag=tag, label=f"place_single:{sym}")
+            t_recv, tag=tag, label=f"place_single:{sym}",
+            timeout=_place_wait_sec())
         _idem_store(tag, result)
         return result
 
@@ -404,7 +743,8 @@ def place_straddle(body: StraddleBody, ce_ltp: float = 0, pe_ltp: float = 0):
             out.append(_run_on_worker(
                 _place_tracked, ex, sym, qty, entry, body.target_points, body.stop_points,
                 body.strategy, body.trail_distance, body.product,
-                body.side, t_recv, tag=tag, label=f"place_straddle:{sym}"))
+                body.side, t_recv, tag=tag, label=f"place_straddle:{sym}",
+                timeout=_place_wait_sec()))
         result = {"legs": out}
         _idem_store(tag, result)
         return result
@@ -567,21 +907,103 @@ def exit_position(body: ExitBody):
                           label=f"exit_position:{body.symbol.strip().upper()}")
 
 
+def _positions_strict():
+    """Worker-side positions read: failure must never look like a flat account."""
+    assert kotak is not None
+    return kotak.positions(strict=True)
+
+
+def _manual_exit_response(rec: dict, order, adopted: bool, t_b1: int) -> dict:
+    base = copy.deepcopy(rec.get("base") or {})
+    base.pop("_t_recv_ms", None)
+    t_recv = int(rec.get("t_recv_ms") or _ms())
+    t_b0 = int(rec.get("t_b0_ms") or t_b1)
+    return {
+        **base,
+        "exit_order": order,
+        "adopted": bool(adopted),
+        "manual_exit_tag": rec.get("tag"),
+        "client_tag": rec.get("client_tag"),
+        "timing": {"server_recv_ms": t_recv, "broker_rtt_ms": t_b1 - t_b0,
+                   "server_total_ms": _ms() - t_recv, "placed_at_ms": t_b1},
+    }
+
+
+def _manual_exit_existing(symbol: str):
+    """Replay/adopt a prior manual exit instead of placing a duplicate."""
+    rec = _manual_exit_get(symbol)
+    if rec is None:
+        return None
+    if rec.get("state") == "complete" and rec.get("response"):
+        return copy.deepcopy(rec["response"])
+    tag = str(rec.get("tag") or "")
+    if tag:
+        found, _book_ok, _reason, _matches = _find_manual_exit_confirmed(tag)
+        if found is not None:
+            oid = str(found.get("nOrdNo") or "")
+            st = str(found.get("ordSt") or "").lower()
+            if "reject" in st:
+                engine.abandon_manual_exit_tag(tag)
+                _manual_exit_drop(symbol, tag)
+                raise HTTPException(
+                    status_code=502,
+                    detail=f"Exit rejected for {symbol}: {st}")
+            if oid:
+                resp = _manual_exit_response(rec, found, True, _ms())
+                _manual_exit_update(symbol, tag, state="complete", response=resp,
+                                    updated_at=time.time())
+                engine.complete_manual_exit_tag(tag, oid)
+                log.warning("EXIT MANUAL adopted by tag %s -> order %s (%s)",
+                            tag, oid, symbol)
+                return resp
+        if rec.get("state") == "ambiguous":
+            raise HTTPException(
+                status_code=502,
+                detail=(f"Previous exit for {symbol} is still unconfirmed "
+                        f"(tag {tag}); no duplicate was sent. Check the order "
+                        "book/positions before retrying."))
+    raise HTTPException(
+        status_code=409,
+        detail=(f"A manual exit for {symbol} is already in progress; "
+                "no duplicate was sent."))
+
+
 def _exit_position_impl(body: ExitBody):
     """Flatten one net position at market and stand down its bracket.
 
     1. sizes the exit from the live broker position (full net qty),
     2. cancels any live entry/SL exchange orders for that symbol,
-    3. marks those synthetic trackers CLOSED (target is synthetic — there is
+    3. marks those synthetic trackers CLOSED (target is synthetic - there is
        no exchange target order to cancel),
-    4. fires one market order in the opposite direction.
+    4. fires one tagged market order in the opposite direction.
+
+    Positions are read through the strict read worker: timeout/queue/broker
+    failure maps to 504/503/502, never a 404 "no position" on a failed read.
+    The market exit carries a deterministic tag stored before the broker call.
+    A lost response is resolved by that tag; repeated clicks/symbol retries
+    replay or adopt the same exit and never place a second one.
     """
     assert kotak is not None and engine is not None
     symbol = body.symbol.strip().upper()
     if not symbol:
         raise HTTPException(status_code=400, detail="symbol required")
+    existing = _manual_exit_existing(symbol)
+    if existing is not None:
+        return existing
     t_recv = _ms()
-    pos = _broker_call(kotak.positions).get(symbol)
+    try:
+        positions = _run_read(_positions_strict,
+                              label=f"exit_position:positions:{symbol}")
+    except HTTPException:
+        raise
+    except Exception as e:
+        log.error("exit-position positions read failed for %s: %s",
+                  symbol, _safe_text(e))
+        raise HTTPException(
+            status_code=502,
+            detail=(f"Positions unavailable for {symbol}: {_safe_text(e)} "
+                    "(no exit order was sent)")) from e
+    pos = (positions or {}).get(symbol)
     if not pos:
         raise HTTPException(status_code=404, detail=f"No open position in {symbol}")
     try:
@@ -618,30 +1040,103 @@ def _exit_position_impl(body: ExitBody):
                 _broker_call(kotak.cancel, str(oid))
                 cancelled.append({"order_id": str(oid), "what": key})
             except Exception as e:
-                cancelled.append({"order_id": str(oid), "what": key, "warn": str(e)[:200]})
+                cancelled.append({"order_id": str(oid), "what": key,
+                                  "warn": _safe_text(e)})
     engine.mark_manual_exit(symbol)
 
+    client_tag = (body.client_order_tag or "").strip() or None
+    tag = None
+    for _ in range(4):
+        candidate = SyntheticEngine.make_tag("X", _entry_ref(), 1)
+        if engine.register_manual_exit_tag(candidate, symbol, client_tag):
+            tag = candidate
+            break
+    if tag is None:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Could not allocate a unique manual-exit tag for {symbol}")
+    rec, claimed = _manual_exit_claim(symbol, tag, client_tag)
+    if not claimed:
+        engine.abandon_manual_exit_tag(tag)
+        replay = _manual_exit_get(symbol)
+        if replay and replay.get("response"):
+            return copy.deepcopy(replay["response"])
+        raise HTTPException(
+            status_code=409,
+            detail=(f"A manual exit for {symbol} is already in progress; "
+                    "no duplicate was sent."))
+
+    base = {
+        "symbol": symbol, "exit_side": ("SELL" if exit_txn == "S" else "BUY"),
+        "quantity": str(shares), "exchange": exchange, "product": product,
+        "cancelled": cancelled, "closed_legs": len(legs),
+    }
     t_b0 = _ms()
+    _manual_exit_update(symbol, tag, base=base, t_recv_ms=t_recv, t_b0_ms=t_b0)
     try:
-        r = _broker_call(kotak.place_market_exit, exchange, str(shares), symbol,
-                         transaction_type=exit_txn, product=product)
+        r = _call_place_with_tag(
+            kotak.place_market_exit, exchange, str(shares), symbol,
+            tag=tag, transaction_type=exit_txn, product=product)
+        t_b1 = _ms()
     except HTTPException:
+        engine.abandon_manual_exit_tag(tag)
+        _manual_exit_drop(symbol, tag)
         raise
     except Exception as e:
-        log.error("exit-position MKT failed for %s: %s", symbol, e)
-        raise HTTPException(status_code=502, detail=f"Exit order failed for {symbol}: {e}")
-    t_b1 = _ms()
+        t_b1 = _ms()
+        last_error = _safe_text(e)
+        log.error("exit-position MKT failed for %s tag=%s: %s",
+                  symbol, tag, last_error)
+        found, book_ok, reason, matches = _find_manual_exit_confirmed(tag)
+        if found is not None:
+            oid = str(found.get("nOrdNo") or "")
+            st = str(found.get("ordSt") or "").lower()
+            if "reject" in st:
+                engine.abandon_manual_exit_tag(tag)
+                _manual_exit_drop(symbol, tag)
+                raise HTTPException(
+                    status_code=502,
+                    detail=f"Exit rejected for {symbol}: {st}") from e
+            if oid:
+                rec = _manual_exit_get(symbol) or rec
+                resp = _manual_exit_response(rec, found, True, t_b1)
+                _manual_exit_update(symbol, tag, state="complete", response=resp)
+                engine.complete_manual_exit_tag(tag, oid)
+                log.warning("EXIT MANUAL adopted by tag %s -> order %s (%s)",
+                            tag, oid, symbol)
+                return resp
+        _manual_exit_update(symbol, tag, state="ambiguous", error=last_error)
+        if reason.startswith("ambiguous"):
+            raise HTTPException(
+                status_code=502,
+                detail=(f"Exit placement ambiguous for {symbol}: "
+                        f"{len(matches)} broker order(s) match tag {tag}; no "
+                        "retry was sent. Check the order book.")) from e
+        if not book_ok:
+            raise HTTPException(
+                status_code=502,
+                detail=(f"Exit placement uncertain for {symbol}: {last_error} "
+                        "(order book unavailable; no automatic retry)")) from e
+        raise HTTPException(
+            status_code=502,
+            detail=(f"Exit placement uncertain for {symbol}: {last_error} "
+                    f"(tag {tag} not in the order book yet; no retry was sent)")) from e
     if not (r and _broker_ok(r)):
-        # Log the full rejection server-side — the UI only shows a summary and
+        engine.abandon_manual_exit_tag(tag)
+        _manual_exit_drop(symbol, tag)
+        # Log the full rejection server-side - the UI only shows a summary and
         # the order-feed REJECTED row is the only other trace.
         log.error("exit-position MKT rejected for %s (side=%s qty=%s product=%s): %s",
-                  symbol, exit_txn, shares, product, r)
-        raise HTTPException(status_code=502, detail=f"Exit rejected for {symbol}: {r}")
-    return {"symbol": symbol, "exit_side": ("SELL" if exit_txn == "S" else "BUY"),
-            "quantity": str(shares), "exchange": exchange, "product": product,
-            "cancelled": cancelled, "closed_legs": len(legs), "exit_order": r,
-            "timing": {"server_recv_ms": t_recv, "broker_rtt_ms": t_b1 - t_b0,
-                       "server_total_ms": _ms() - t_recv, "placed_at_ms": t_b1}}
+                  symbol, exit_txn, shares, product, _safe_text(r))
+        raise HTTPException(status_code=502,
+                            detail=f"Exit rejected for {symbol}: {_safe_text(r)}")
+    oid = str(r.get("nOrdNo") or "")
+    rec = _manual_exit_get(symbol) or rec
+    resp = _manual_exit_response(rec, r, False, t_b1)
+    _manual_exit_update(symbol, tag, state="complete", response=resp)
+    engine.complete_manual_exit_tag(tag, oid)
+    return resp
+
 
 
 @router.post("/force-exit")

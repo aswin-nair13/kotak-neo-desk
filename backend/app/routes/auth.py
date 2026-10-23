@@ -2,7 +2,7 @@ from fastapi import APIRouter, Depends, HTTPException
 
 from ..auth import create_token, require_user, verify_app_password
 from ..config import settings
-from ..kotak_client import KotakService
+from ..kotak_client import KotakService, sanitize_error_text
 from ..schemas import KotakCompleteBody
 
 router = APIRouter()
@@ -32,14 +32,16 @@ def kotak_complete(body: KotakCompleteBody):
     try:
         kotak.complete_login(settings.kotak_mobile_number, settings.kotak_ucc, body.totp, settings.kotak_mpin)
     except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
+        raise HTTPException(status_code=400,
+                            detail=sanitize_error_text(e)) from e
     # Feeds run on the server via the SFeed bridge (SDK v3 async WS on a
     # background thread). Legacy client.subscribe() was removed in v2.2+.
     try:
         if bridge is not None:
             bridge.start()
     except Exception as e:
-        return {"ok": True, "warn": f"logged in, feed bridge failed: {e}"}
+        return {"ok": True,
+                "warn": f"logged in, feed bridge failed: {sanitize_error_text(e)}"}
     return {"ok": True}
 
 

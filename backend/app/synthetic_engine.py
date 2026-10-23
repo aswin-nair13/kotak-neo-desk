@@ -1,4 +1,4 @@
-"""Synthetic bracket engine — port of TransTrader controller logic.
+"""Synthetic bracket engine - port of TransTrader controller logic.
 
 Lifecycle per leg: PENDING_ENTRY -> ACTIVE -> {CLOSING -> CLOSED | TRAILING -> CLOSED} | ERRORED
   - entry fill  -> auto-place SL sell
@@ -9,10 +9,13 @@ Feeds: on_order_update(order_details) from Kotak order socket; on_tick(tick) fro
 
 import copy
 import logging
+import re
 import threading
 import time
+import zlib
 
 from .config import settings
+from .kotak_client import sanitize_error_text
 
 log = logging.getLogger("synthetic")
 
@@ -21,6 +24,17 @@ class SyntheticEngine:
     def __init__(self, broker, book_fetcher=None, sleep_fn=None, clock_fn=None):
         self.broker = broker  # KotakService
         self.orders: dict[str, dict] = {}  # entry_order_id -> tracker
+        # Plan 06 WP8: durable registry of every entry tag we generated. It is
+        # NEVER silently discarded: a timed-out attempt becomes "superseded" and
+        # a late order carrying that tag is still adopted (with a DUPLICATE_ENTRY
+        # alert) instead of being ignored. Bounded by age/count.
+        self._entry_tags: dict[str, dict] = {}
+        # Manual Exit-button flatten orders are not attached to a tracker, but
+        # their deterministic tags must still be recognised by the feed so a
+        # timed-out/late manual exit is not mistaken for an orphan.
+        self._manual_exit_tags: dict[str, dict] = {}
+        # Broker orders carrying one of our tags but not matching a tracker id.
+        self.orphaned_orders: dict[str, dict] = {}
         # Worker-safe order-book provider: returns (mapped_book, ok). Wired to
         # SFeedBridge.fetch_book in production, so cancel confirmation reads the
         # broker book on the single-writer worker and never on the feed loop.
@@ -39,35 +53,313 @@ class SyntheticEngine:
         self._lock = threading.RLock()
 
     # -- CRUD --
+    def _add_locked(self, d: dict) -> dict:
+        d = copy.deepcopy(d)
+        # Plan 06 WP3: the SL guarantee clock starts when the entry is
+        # accepted/registered, not when the feed eventually reports a fill.
+        if d.get("sl_guarantee_due_ms") is None:
+            d["sl_guarantee_due_ms"] = (
+                int(time.time() * 1000)
+                + int(max(0.0, settings.sl_guarantee_sec) * 1000))
+        d.setdefault("last_reconcile_ms", None)
+        d.setdefault("naked_position", False)
+        d.setdefault("blocked_reason", None)
+        d.setdefault("exit_pending", False)
+        d.setdefault("exit_state", None)
+        d.setdefault("exit_ambiguous", False)
+        d.setdefault("exit_unknown_streak", 0)
+        # Plan 06 WP5: where/when the tracker last agreed with broker state,
+        # and a manual modify window that suppresses automatic SL re-place.
+        d.setdefault("last_synced_ms", None)
+        d.setdefault("source", None)
+        d.setdefault("sl_modify_pending", False)
+        d.setdefault("sl_modify_target", None)
+        d.setdefault("sl_modify_deadline_ms", None)
+        d.setdefault("manual_sl_cancel", False)
+        d.setdefault("manual_sl_cancel_pending", False)
+        d.setdefault("manual_sl_cancel_deadline_ms", None)
+        d.setdefault("manual_sl_cancel_confirmed", False)
+        d.setdefault("cancel_requested_ids", {})
+        self.orders[d["entry_order_id"]] = d
+        return d
+
     def add(self, d: dict):
         with self._lock:
-            d = copy.deepcopy(d)
-            # Plan 06 WP3: the SL guarantee clock starts when the entry is
-            # accepted/registered, not when the feed eventually reports a fill.
-            if d.get("sl_guarantee_due_ms") is None:
-                d["sl_guarantee_due_ms"] = (
-                    int(time.time() * 1000)
-                    + int(max(0.0, settings.sl_guarantee_sec) * 1000))
-            d.setdefault("last_reconcile_ms", None)
-            d.setdefault("naked_position", False)
-            d.setdefault("blocked_reason", None)
-            d.setdefault("exit_pending", False)
-            d.setdefault("exit_state", None)
-            d.setdefault("exit_ambiguous", False)
-            d.setdefault("exit_unknown_streak", 0)
-            # Plan 06 WP5: where/when the tracker last agreed with broker state,
-            # and a manual modify window that suppresses automatic SL re-place.
-            d.setdefault("last_synced_ms", None)
-            d.setdefault("source", None)
-            d.setdefault("sl_modify_pending", False)
-            d.setdefault("sl_modify_target", None)
-            d.setdefault("sl_modify_deadline_ms", None)
-            d.setdefault("manual_sl_cancel", False)
-            d.setdefault("manual_sl_cancel_pending", False)
-            d.setdefault("manual_sl_cancel_deadline_ms", None)
-            d.setdefault("manual_sl_cancel_confirmed", False)
-            d.setdefault("cancel_requested_ids", {})
-            self.orders[d["entry_order_id"]] = d
+            return self._add_locked(d)
+
+    def _tag_known_locked(self, tag: str) -> bool:
+        tag = str(tag or "")
+        if not tag:
+            return False
+        if tag in self._entry_tags:
+            return True
+        if tag in self._manual_exit_tags:
+            return True
+        for o in self.orders.values():
+            if tag in (str(o.get("entry_client_tag") or ""),
+                       str(o.get("sl_client_tag") or ""),
+                       str(o.get("exit_client_tag") or ""),
+                       str(o.get("tag") or "")):
+                return True
+        return False
+
+    @staticmethod
+    def is_our_tag_format(tag: str) -> bool:
+        """Recognise our tag shape even after its registry record has expired."""
+        value = str(tag or "")
+        if not value or len(value) > 20:
+            return False
+        prefix = str(getattr(settings, "order_tag_prefix", "") or "")
+        pattern = (r"^" + re.escape(prefix)
+                   + r"[ESX][A-Za-z0-9]{2,16}-\d{1,3}$")
+        return re.fullmatch(pattern, value) is not None
+
+    def _prune_entry_tags_locked(self, now_ms: int | None = None):
+        """Bound the durable tag registry by TTL and count.
+
+        Pending intents are pruned last so an in-flight/ambiguous placement is
+        not lost before terminal/superseded history. A tag that outlives the
+        registry still matches `is_our_tag_format`, so a late order is alerted
+        as an orphan rather than silently ignored.
+        """
+        now = int(time.time() * 1000) if now_ms is None else int(now_ms)
+        ttl_ms = int(max(0.0, float(settings.order_tag_ttl_sec)) * 1000)
+        for tag, rec in list(self._entry_tags.items()):
+            if now - int(rec.get("updated_ms") or rec.get("created_ms") or now) >= ttl_ms:
+                self._entry_tags.pop(tag, None)
+        limit = max(1, int(settings.order_tag_registry_max))
+        if len(self._entry_tags) > limit:
+            ordered = sorted(
+                self._entry_tags.items(),
+                key=lambda kv: (kv[1].get("state") == "pending",
+                                int(kv[1].get("updated_ms") or 0)))
+            for tag, rec in ordered[:len(self._entry_tags) - limit]:
+                if rec.get("state") == "pending":
+                    log.warning("entry tag registry full: dropping pending tag %s", tag)
+                self._entry_tags.pop(tag, None)
+
+    def register_entry_intent(self, tag: str, d: dict) -> bool:
+        """Pre-register a deterministic entry tag before calling the broker.
+
+        The intent holds everything `add` needs except the entry order id, so a
+        timed-out placement that later appears on the feed/book can be adopted
+        by tag even though no tracker existed when the broker accepted it.
+        """
+        tag = str(tag or "").strip()
+        if not tag:
+            return False
+        now = int(time.time() * 1000)
+        with self._lock:
+            self._prune_entry_tags_locked(now)
+            if self._tag_known_locked(tag):
+                return False
+            intent = copy.deepcopy(d)
+            intent["entry_client_tag"] = tag
+            intent["tag"] = tag
+            intent["intent_at_ms"] = now
+            self._entry_tags[tag] = {
+                "tag": tag, "kind": "entry", "state": "pending",
+                "ref": str(intent.get("_entry_ref") or ""),
+                "attempt": int(intent.get("_attempt") or 1),
+                "created_ms": now, "updated_ms": now,
+                "intent": intent,
+            }
+        return True
+
+    def _entry_tag_record_locked(self, tag: str) -> dict | None:
+        return self._entry_tags.get(str(tag or ""))
+
+    def supersede_entry_intent(self, tag: str, reason: str,
+                               superseded_by: str | None = None) -> bool:
+        """Keep a timed-out attempt recognisable after a retry is allowed."""
+        with self._lock:
+            rec = self._entry_tag_record_locked(tag)
+            if rec is None:
+                return False
+            now = int(time.time() * 1000)
+            rec["state"] = "superseded"
+            rec["superseded_ms"] = now
+            rec["updated_ms"] = now
+            rec["reason"] = str(reason or "")[:240]
+            if superseded_by:
+                rec["superseded_by"] = str(superseded_by)
+            return True
+
+    def abandon_entry_intent(self, tag: str, reason: str) -> bool:
+        """Definite failure (rejection): keep the tag recorded, stop treating it
+        as an adoptable pending intent."""
+        with self._lock:
+            rec = self._entry_tag_record_locked(tag)
+            if rec is None:
+                return False
+            now = int(time.time() * 1000)
+            rec["state"] = "abandoned"
+            rec["abandoned_ms"] = now
+            rec["updated_ms"] = now
+            rec["reason"] = str(reason or "")[:240]
+            return True
+
+    def mark_entry_ambiguous(self, tag: str, reason: str) -> bool:
+        with self._lock:
+            rec = self._entry_tag_record_locked(tag)
+            if rec is None:
+                return False
+            rec["ambiguous"] = True
+            rec["ambiguous_reason"] = str(reason or "")[:240]
+            rec["updated_ms"] = int(time.time() * 1000)
+            return True
+
+    def _adopt_entry_tag_locked(self, rec: dict, oid: str,
+                                tag: str) -> dict | None:
+        """Attach a registered intent to a discovered broker order exactly once."""
+        if not rec or rec.get("state") not in ("pending", "superseded"):
+            return None
+        superseded = rec.get("state") == "superseded"
+        intent = copy.deepcopy(rec.get("intent") or {})
+        intent.pop("_intent_id", None)
+        intent.pop("_entry_ref", None)
+        intent.pop("_attempt", None)
+        intent["entry_order_id"] = str(oid)
+        intent["entry_adopted_by_tag"] = str(tag)
+        if superseded:
+            now = int(time.time() * 1000)
+            intent["duplicate_entry"] = True
+            intent["duplicate_entry_tag"] = str(tag)
+            intent["duplicate_entry_alert_ms"] = now
+            log.critical(
+                "DUPLICATE_ENTRY %s entry=%s tag=%s: a superseded entry attempt "
+                "landed after a retry - both orders may be live; manual check "
+                "required", intent.get("trading_symbol"), oid, tag)
+        syn = self.add(intent)
+        rec["state"] = "adopted"
+        rec["entry_order_id"] = str(oid)
+        rec["adopted_ms"] = int(time.time() * 1000)
+        rec["updated_ms"] = rec["adopted_ms"]
+        return syn
+
+    def commit_entry(self, tag: str, entry_id: str) -> dict | None:
+        """Attach a pre-registered intent to its broker order id exactly once."""
+        eid = str(entry_id or "").strip()
+        if not eid:
+            return None
+        with self._lock:
+            existing = self.orders.get(eid)
+            if existing is not None:
+                rec = self._entry_tag_record_locked(tag)
+                if rec is not None and rec.get("state") in ("pending", "superseded"):
+                    rec["state"] = "adopted"
+                    rec["entry_order_id"] = eid
+                    rec["adopted_ms"] = int(time.time() * 1000)
+                    rec["updated_ms"] = rec["adopted_ms"]
+                return copy.deepcopy(existing)
+            rec = self._entry_tag_record_locked(tag)
+            syn = self._adopt_entry_tag_locked(rec, eid, tag)
+            return copy.deepcopy(syn) if syn is not None else None
+
+    def by_entry_tag(self, tag: str) -> dict | None:
+        """A tracker whose entry was placed/adopted under this client tag."""
+        tag = str(tag or "")
+        if not tag:
+            return None
+        with self._lock:
+            for o in self.orders.values():
+                if tag in (str(o.get("entry_client_tag") or ""),
+                           str(o.get("tag") or ""),
+                           str(o.get("entry_adopted_by_tag") or "")):
+                    return copy.deepcopy(o)
+        return None
+
+    def pending_entry_tags(self) -> list[str]:
+        with self._lock:
+            self._prune_entry_tags_locked()
+            return [tag for tag, rec in self._entry_tags.items()
+                    if rec.get("state") == "pending"]
+
+    def entry_intent_health(self) -> dict:
+        """Pending/superseded entry attempts for /api/health (no payloads)."""
+        with self._lock:
+            self._prune_entry_tags_locked()
+            rows = []
+            for tag, rec in self._entry_tags.items():
+                rows.append({
+                    "tag": tag, "state": rec.get("state"),
+                    "ref": rec.get("ref"), "attempt": rec.get("attempt"),
+                    "created_ms": rec.get("created_ms"),
+                    "updated_ms": rec.get("updated_ms"),
+                    "superseded_ms": rec.get("superseded_ms"),
+                    "adopted_ms": rec.get("adopted_ms"),
+                    "entry_order_id": rec.get("entry_order_id"),
+                    "superseded_by": rec.get("superseded_by"),
+                    "reason": rec.get("reason"),
+                    "ambiguous": bool(rec.get("ambiguous")),
+                })
+        by_state: dict[str, list[dict]] = {
+            "pending": [], "superseded": [], "abandoned": [], "adopted": []}
+        for row in rows:
+            by_state.setdefault(str(row.get("state")), []).append(row)
+        return {
+            "pending": by_state.get("pending", []),
+            "superseded": by_state.get("superseded", []),
+            "abandoned": by_state.get("abandoned", []),
+            "adopted": by_state.get("adopted", []),
+            "counts": {k: len(v) for k, v in by_state.items()},
+            "registry_size": len(rows),
+        }
+
+    def _prune_manual_exit_tags_locked(self, now_ms: int | None = None):
+        now = int(time.time() * 1000) if now_ms is None else int(now_ms)
+        ttl_ms = int(max(0.0, float(settings.order_tag_ttl_sec)) * 1000)
+        for tag, rec in list(self._manual_exit_tags.items()):
+            if now - int(rec.get("updated_ms") or rec.get("created_ms") or now) >= ttl_ms:
+                self._manual_exit_tags.pop(tag, None)
+        limit = max(1, int(settings.order_tag_registry_max))
+        if len(self._manual_exit_tags) > limit:
+            ordered = sorted(self._manual_exit_tags.items(),
+                             key=lambda kv: int(kv[1].get("updated_ms") or 0))
+            for tag, _rec in ordered[:len(self._manual_exit_tags) - limit]:
+                self._manual_exit_tags.pop(tag, None)
+
+    def register_manual_exit_tag(self, tag: str, symbol: str,
+                                 client_tag: str | None = None) -> bool:
+        """Reserve a manual-exit tag before the broker call (never reuse)."""
+        tag = str(tag or "").strip()
+        if not tag:
+            return False
+        now = int(time.time() * 1000)
+        with self._lock:
+            self._prune_manual_exit_tags_locked(now)
+            if self._tag_known_locked(tag) or tag in self._manual_exit_tags:
+                return False
+            self._manual_exit_tags[tag] = {
+                "tag": tag, "kind": "manual_exit", "symbol": str(symbol or ""),
+                "client_tag": str(client_tag or ""), "state": "pending",
+                "order_id": None, "created_ms": now, "updated_ms": now,
+            }
+        return True
+
+    def complete_manual_exit_tag(self, tag: str, order_id: str | None) -> bool:
+        with self._lock:
+            rec = self._manual_exit_tags.get(str(tag or ""))
+            if rec is None:
+                return False
+            now = int(time.time() * 1000)
+            rec.update(state="complete", order_id=str(order_id or "") or None,
+                       completed_ms=now, updated_ms=now)
+            return True
+
+    def abandon_manual_exit_tag(self, tag: str) -> bool:
+        with self._lock:
+            rec = self._manual_exit_tags.get(str(tag or ""))
+            if rec is None:
+                return False
+            now = int(time.time() * 1000)
+            rec.update(state="abandoned", updated_ms=now, abandoned_ms=now)
+            return True
+
+    def manual_exit_tag_record(self, tag: str) -> dict | None:
+        with self._lock:
+            rec = self._manual_exit_tags.get(str(tag or ""))
+            return copy.deepcopy(rec) if rec is not None else None
 
     def _by_any_id_locked(self, oid: str) -> dict | None:
         if oid in self.orders:
@@ -93,7 +385,7 @@ class SyntheticEngine:
 
     def by_tokens(self, token: str) -> list[dict]:
         """ALL working legs on an instrument token. Two entries on the same
-        strike share one token — every leg must be evaluated per tick, not
+        strike share one token - every leg must be evaluated per tick, not
         just the first found."""
         with self._lock:
             return [copy.deepcopy(o) for o in self._by_tokens_locked(str(token))]
@@ -273,7 +565,7 @@ class SyntheticEngine:
                     syn["sl_modify_expired_ms"] = now
                     pending_cleared = True
                     log.warning("SL MODIFY PENDING EXPIRED %s entry=%s "
-                                "(target=%s) — adopting broker state",
+                                "(target=%s) - adopting broker state",
                                 syn.get("trading_symbol"),
                                 syn.get("entry_order_id"),
                                 syn.get("sl_modify_target"))
@@ -287,7 +579,7 @@ class SyntheticEngine:
                     syn["manual_sl_cancel_deadline_ms"] = None
                     syn["manual_sl_cancel_still_working_ms"] = now
                     log.error("MANUAL SL CANCEL NOT APPLIED %s entry=%s sl=%s: "
-                              "SL still working after %.1fs — no automatic "
+                              "SL still working after %.1fs - no automatic "
                               "re-place; operator may retry cancel",
                               syn.get("trading_symbol"),
                               syn.get("entry_order_id"),
@@ -318,7 +610,7 @@ class SyntheticEngine:
             if deadline is not None and now >= deadline:
                 syn["sl_modify_pending"] = False
                 syn["sl_modify_expired_ms"] = now
-                log.warning("SL MODIFY TIMEOUT %s entry=%s target=%s — pending "
+                log.warning("SL MODIFY TIMEOUT %s entry=%s target=%s - pending "
                             "cleared; broker/book state wins",
                             syn.get("trading_symbol"),
                             syn.get("entry_order_id"),
@@ -348,7 +640,7 @@ class SyntheticEngine:
         """Broker response for a manual modify.
 
         Success keeps the pending window open until the feed/book echoes the new
-        trigger (book wins). Failure clears it and raises an explicit alert —
+        trigger (book wins). Failure clears it and raises an explicit alert -
         the tracker is never silently reverted.
         """
         now = int(time.time() * 1000)
@@ -364,7 +656,7 @@ class SyntheticEngine:
             syn["sl_modify_deadline_ms"] = None
             syn["sl_modify_failed_ms"] = now
             syn["sl_modify_error"] = str(error or "")[:200]
-        log.error("SL MODIFY FAILED %s entry=%s order=%s: %s — pending cleared, "
+        log.error("SL MODIFY FAILED %s entry=%s order=%s: %s - pending cleared, "
                   "tracker NOT reverted", syn.get("trading_symbol"),
                   syn.get("entry_order_id"), order_id, error)
 
@@ -481,12 +773,9 @@ class SyntheticEngine:
         elif kind == "cancel_exit":
             # The SL completed while our market exit was already working: the
             # position is closed, so try to stop the (now unwanted) exit order
-            # instead of leaving it free to flip the position.
-            try:
-                self.broker.cancel(payload)
-            except Exception as e:  # noqa: BLE001 - best effort, alert below
-                log.error("late exit cancel failed for %s (%s): %s",
-                          syn.get("trading_symbol"), payload, e)
+            # instead of leaving it free to flip the position. The cancel id was
+            # recorded under the lock above, so this is exactly-once.
+            self._safe_cancel(str(payload), "late exit after CLOSED")
 
     @staticmethod
     def _is_reject(st: str) -> bool:
@@ -533,7 +822,18 @@ class SyntheticEngine:
             # Plan 06 M1: adopt an exit whose placement response timed out by
             # its deterministic client tag (Kotak echoes it as GuiOrdId).
             tag = self._order_tag(od)
-            if tag:
+            # Plan 06 WP8: an entry pre-registered its deterministic tag before
+            # the broker call. A timed-out placement that landed is attached to
+            # that intent here, before its fill/reject frame is processed. A
+            # superseded attempt is still adopted (with a DUPLICATE_ENTRY alert).
+            rec = self._entry_tag_record_locked(tag) if tag else None
+            if rec is not None and rec.get("state") in ("pending", "superseded"):
+                was_superseded = rec.get("state") == "superseded"
+                syn = self._adopt_entry_tag_locked(rec, str(oid), tag)
+                if syn is not None and not was_superseded:
+                    log.warning("ENTRY AMBIGUOUS adopted by tag %s -> order %s "
+                                "(%s)", tag, oid, syn.get("trading_symbol"))
+            if tag and not syn:
                 for o in self.orders.values():
                     if (not o.get("exit_order_id")
                             and str(o.get("exit_client_tag") or "") == tag):
@@ -541,12 +841,18 @@ class SyntheticEngine:
                             # Never attach a late working exit to a closed leg:
                             # the position is flat and the exit would flip it.
                             if self._is_open(status):
-                                log.critical(
-                                    "LATE EXIT RISK %s entry=%s: ambiguous exit "
-                                    "%s (%s) appeared after CLOSED - cancelling",
-                                    o.get("trading_symbol"),
-                                    o.get("entry_order_id"), oid, status)
-                                return ("cancel_exit", o, str(oid))
+                                if self._mark_late_exit_cancel_locked(
+                                        o, oid, "late tagged exit after CLOSED"):
+                                    log.critical(
+                                        "LATE EXIT RISK %s entry=%s: ambiguous "
+                                        "exit %s (%s) appeared after CLOSED - "
+                                        "cancelling", o.get("trading_symbol"),
+                                        o.get("entry_order_id"), oid, status)
+                                    return ("cancel_exit", o, str(oid))
+                                log.warning("late exit %s cancel already requested "
+                                            "for CLOSED %s", oid,
+                                            o.get("entry_order_id"))
+                                return None
                             log.warning("late exit %s already %s for CLOSED %s",
                                         oid, status, o.get("entry_order_id"))
                             return None
@@ -585,6 +891,9 @@ class SyntheticEngine:
                                         syn["trading_symbol"])
                             break
         if not syn:
+            tag = self._order_tag(od) if oid else ""
+            if tag:
+                self._record_orphan_locked(od, tag)
             return None
         t_now = int(time.time() * 1000)
         log.info("synthetic %s: %s -> %s (%s)", syn["trading_symbol"], oid, status, syn["status"])
@@ -605,7 +914,7 @@ class SyntheticEngine:
             with self._lock:
                 syn["status"] = "ERRORED"
                 syn["blocked_reason"] = "SL_CANCELLED_MANUAL"
-                syn["error"] = f"SL {oid} cancelled manually — position is naked"
+                syn["error"] = f"SL {oid} cancelled manually - position is naked"
                 syn["naked_position"] = True
                 syn["exit_pending"] = False
                 syn["exit_state"] = "BLOCKED"
@@ -614,7 +923,7 @@ class SyntheticEngine:
                 syn["manual_sl_cancel_confirmed"] = True
                 syn["last_synced_ms"] = t_now
                 syn["source"] = "external"
-            log.error("SL MANUALLY CANCELLED %s entry=%s sl=%s — NAKED POSITION "
+            log.error("SL MANUALLY CANCELLED %s entry=%s sl=%s - NAKED POSITION "
                       "(automatic re-place suppressed)", syn.get("trading_symbol"),
                       syn.get("entry_order_id"), oid)
             return None
@@ -639,7 +948,7 @@ class SyntheticEngine:
 
         elif oid == syn["entry_order_id"] and syn["status"] == "PENDING_ENTRY" \
                 and self._is_reject(status):
-            # Entry never reached the book — no protective SL to place.
+            # Entry never reached the book - no protective SL to place.
             syn["status"] = "ERRORED"
             syn["error"] = f"entry rejected: {od.get('rejRsn', '')}"
             syn["blocked_reason"] = "ENTRY_REJECTED"
@@ -650,15 +959,15 @@ class SyntheticEngine:
         elif oid == syn["entry_order_id"] and syn["status"] == "PENDING_ENTRY" \
                 and self._is_cancel(status):
             # Plan 06 M2: a cancel can race a partial fill. Never close the leg
-            # and leave the filled part unprotected — size the SL to the fill.
+            # and leave the filled part unprotected - size the SL to the fill.
             filled = self._fill_qty(od)
             syn["entry_cancel_pending"] = False
             if filled and filled > 0:
                 if syn.get("sl_placed") or syn.get("sl_order_id"):
                     return None
                 syn["error"] = ("entry cancelled after a partial fill "
-                                f"({int(filled)}) — placing SL for the fill")
-                log.error("PARTIAL ENTRY CANCEL %s (%s): %s filled — placing "
+                                f"({int(filled)}) - placing SL for the fill")
+                log.error("PARTIAL ENTRY CANCEL %s (%s): %s filled - placing "
                           "protective SL before closing the tracker",
                           syn["trading_symbol"], oid, int(filled))
                 return ("place_sl", syn, od)
@@ -684,14 +993,14 @@ class SyntheticEngine:
                      syn.get("entry_order_id"), oid)
             if late_exit:
                 log.error("LATE EXIT RISK %s: SL %s completed after market exit %s "
-                          "was placed — attempting to cancel the exit",
+                          "was placed - attempting to cancel the exit",
                           syn["trading_symbol"], oid, late_exit)
                 return ("cancel_exit", syn, late_exit)
 
         elif oid == syn.get("sl_order_id") and self._is_cancel(status) \
                 and syn["status"] == "CLOSING":
             # Kotak sends 'cancelled' for the SL more than once (confirm +
-            # status snapshot). Only the first may fire the market exit —
+            # status snapshot). Only the first may fire the market exit -
             # otherwise we double-exit (flip the position!) or mark ERRORED
             # on a harmless duplicate. `_place_exit` re-checks the same guard.
             if syn.get("exit_order_id") or syn.get("_exit_placing"):
@@ -704,13 +1013,18 @@ class SyntheticEngine:
         elif oid == syn.get("exit_order_id"):
             if syn["status"] == "CLOSED":
                 # A delayed update for an old exit must never reopen/attach to
-                # a closed leg. Stop it if it is still working.
+                # a closed leg. Stop it if it is still working, exactly once.
                 if self._is_open(status):
-                    log.critical(
-                        "LATE EXIT RISK %s entry=%s: exit %s (%s) after CLOSED "
-                        "- cancelling", syn["trading_symbol"],
-                        syn.get("entry_order_id"), oid, status)
-                    return ("cancel_exit", syn, str(oid))
+                    if self._mark_late_exit_cancel_locked(
+                            syn, oid, "exit update after CLOSED"):
+                        log.critical(
+                            "LATE EXIT RISK %s entry=%s: exit %s (%s) after "
+                            "CLOSED - cancelling", syn["trading_symbol"],
+                            syn.get("entry_order_id"), oid, status)
+                        return ("cancel_exit", syn, str(oid))
+                    log.warning("late exit %s cancel already requested for "
+                                "CLOSED %s", oid, syn.get("entry_order_id"))
+                    return None
                 log.warning("late terminal exit %s (%s) for CLOSED %s ignored",
                             oid, status, syn.get("entry_order_id"))
                 return None
@@ -778,7 +1092,7 @@ class SyntheticEngine:
             from .sfeed_bridge import map_book_entry
             return ([m for m in (map_book_entry(r) for r in rows) if m], True)
         except Exception as e:  # noqa: BLE001 - book failure must not crash exit
-            log.error("cancel-confirm order book failed: %s", e)
+            log.error("cancel-confirm order book failed: %s", sanitize_error_text(e))
             return None, False
 
     @staticmethod
@@ -818,6 +1132,98 @@ class SyntheticEngine:
                 return od
         return None
 
+    def _is_our_tag_locked(self, tag: str) -> bool:
+        tag = str(tag or "")
+        if not tag:
+            return False
+        return self._tag_known_locked(tag) or self.is_our_tag_format(tag)
+
+    def _late_exit_owner_locked(self, tag: str) -> dict | None:
+        """The tracker whose deterministic exit tag this order carries."""
+        tag = str(tag or "")
+        if not tag:
+            return None
+        for o in self.orders.values():
+            if str(o.get("exit_client_tag") or "") == tag:
+                return o
+        return None
+
+    def _mark_late_exit_cancel_locked(self, syn: dict, oid: str,
+                                      reason: str) -> bool:
+        """Record a late-exit cancel exactly once, before any broker call.
+
+        Shared by the feed tag-adoption path and the CLOSED reconcile branch so
+        a late tagged exit can never be cancelled twice (or be mistaken for an
+        orphan) when both paths see the same broker order.
+        """
+        oid = str(oid or "")
+        if not oid:
+            return False
+        ids = syn.setdefault("cancel_requested_ids", {})
+        if oid in ids:
+            return False
+        now = int(time.time() * 1000)
+        ids[oid] = {"at_ms": now, "reason": str(reason)}
+        syn["late_exit_risk"] = True
+        if syn.get("late_exit_cancelled_ms") is None:
+            syn["late_exit_cancelled_ms"] = now
+        return True
+
+    def _cancel_late_exit_once(self, syn: dict, oid: str, reason: str) -> bool:
+        """Record + cancel once; broker I/O happens outside the engine lock."""
+        with self._lock:
+            if not self._mark_late_exit_cancel_locked(syn, oid, reason):
+                return False
+        return self._safe_cancel(str(oid), reason)
+
+    def _record_orphan_locked(self, od: dict, tag: str) -> bool:
+        """Record/alert an unknown broker order that carries one of our tags.
+
+        Never silently drop it: a duplicate entry/SL/exit can flip or double a
+        position. It is stored on the engine and (if the tag has an owner leg)
+        flagged on that leg for the UI/health surfaces.
+        """
+        if not self._is_our_tag_locked(tag):
+            return False
+        oid = str(od.get("nOrdNo") or "")
+        if not oid:
+            return False
+        now = int(time.time() * 1000)
+        with self._lock:
+            manual = self._manual_exit_tags.get(str(tag))
+            if manual is not None:
+                # A manual Exit-button flatten has no tracker by design. Keep
+                # its tag known/updated instead of raising a false orphan.
+                manual["order_id"] = oid
+                manual["status"] = str(od.get("ordSt") or "")
+                manual["updated_ms"] = now
+                return False
+        rec = {
+            "order_id": oid,
+            "tag": str(tag),
+            "symbol": str(od.get("trdSym") or od.get("trading_symbol") or ""),
+            "status": str(od.get("ordSt") or ""),
+            "seen_at_ms": now,
+        }
+        with self._lock:
+            first = oid not in self.orphaned_orders
+            self.orphaned_orders[oid] = rec
+            for o in self.orders.values():
+                if tag in (str(o.get("entry_client_tag") or ""),
+                           str(o.get("sl_client_tag") or ""),
+                           str(o.get("exit_client_tag") or ""),
+                           str(o.get("tag") or "")):
+                    ids = o.setdefault("orphaned_order_ids", [])
+                    if oid not in ids:
+                        ids.append(oid)
+                    o["orphaned_alert_ms"] = now
+                    break
+        if first:
+            log.critical("ORPHAN TAGGED ORDER %s tag=%s symbol=%s status=%s - "
+                         "not attached to a tracker; manual check required",
+                         oid, tag, rec["symbol"], rec["status"])
+        return first
+
     def _request_exit_poll(self, delay_sec: float = 0.0):
         """Ask the bridge to queue one follow-up reconcile (never blocks)."""
         fn = self.exit_poll_requester
@@ -830,7 +1236,7 @@ class SyntheticEngine:
                 # Older/custom doubles accept only a zero-argument callback.
                 fn()
         except Exception as e:  # noqa: BLE001 - polling is best effort
-            log.error("exit poll request failed: %s", e)
+            log.error("exit poll request failed: %s", sanitize_error_text(e))
 
     @staticmethod
     def _resp_ok(res) -> bool:
@@ -854,22 +1260,52 @@ class SyntheticEngine:
                 return False
             return True
         except Exception as e:  # noqa: BLE001 - best effort
-            log.error("cancel %s (%s) failed: %s", oid, why, e)
+            log.error("cancel %s (%s) failed: %s", oid, why, sanitize_error_text(e))
             return False
 
     @staticmethod
-    def _new_exit_tag(syn: dict) -> str:
+    def make_tag(action: str, ref: str, attempt: int = 1) -> str:
+        """Deterministic, broker-safe client tag: <prefix><action><ref>-<n>.
+
+        Kotak echoes it as GuiOrdId and limits the tag to 20 chars. The unique
+        reference tail (or a hash when it does not fit) is always preserved, so
+        a prefix can never collapse entry/SL/exit tags onto the same value.
+        """
+        raw_prefix = str(getattr(settings, "order_tag_prefix", "") or "")
+        # Config validates this; sanitise defensively for monkeypatched/direct use.
+        prefix = re.sub(r"[^A-Za-z0-9_-]", "", raw_prefix)[:6]
+        action = (re.sub(r"[^A-Za-z0-9]", "", str(action or "E").upper())[:1]
+                  or "E")
+        suffix = f"-{max(1, min(999, int(attempt))):d}"
+        ref_s = re.sub(r"[^A-Za-z0-9]", "", str(ref or "")) or "0"
+        body = f"{prefix}{action}"
+        room = 20 - len(body) - len(suffix)
+        if room < 4:
+            prefix = ""
+            body = action
+            room = 20 - len(body) - len(suffix)
+        room = max(0, room)
+        if len(ref_s) <= room:
+            ref_part = ref_s
+        else:
+            # Preserve a deterministic hash + tail when the ref is too long.
+            digest = f"{zlib.crc32(ref_s.encode('ascii')):08x}"[-6:]
+            tail_room = max(1, room - len(digest))
+            ref_part = ref_s[-tail_room:] + digest
+        return (f"{body}{ref_part}{suffix}")[:20]
+
+    @classmethod
+    def _new_exit_tag(cls, syn: dict) -> str:
         entry = str(syn.get("entry_order_id") or "E")
         seq = int(syn.get("exit_attempts") or 0) + 1
-        # Deterministic per attempt, short enough for the broker's 20-char tag.
-        return f"X{entry}-{seq}"[:20]
+        return cls.make_tag("X", entry, seq)
 
-    @staticmethod
-    def _new_sl_tag(syn: dict) -> str:
+    @classmethod
+    def _new_sl_tag(cls, syn: dict) -> str:
         entry = str(syn.get("entry_order_id") or "E")
         seq = max(1, int(syn.get("sl_attempts") or 0))
         # Distinct prefix from exit tags; Kotak's tag limit is 20 chars.
-        return f"S{entry}-{seq}"[:20]
+        return cls.make_tag("S", entry, seq)
 
     def _adopt_sl_by_tag(self, syn: dict, book, book_ok):
         """Adopt a timed-out SL placement by its client tag (never duplicate)."""
@@ -920,7 +1356,7 @@ class SyntheticEngine:
             syn["naked_position"] = True
             syn["exit_pending"] = False
             syn["exit_state"] = None
-        log.error("LEG INVALID %s entry=%s: %s — no broker action taken",
+        log.error("LEG INVALID %s entry=%s: %s - no broker action taken",
                   syn.get("trading_symbol"), syn.get("entry_order_id"),
                   ", ".join(missing))
         return "invalid"
@@ -973,8 +1409,8 @@ class SyntheticEngine:
             ok = bool(self._resp_ok(r) and r and r.get("nOrdNo"))
             err = f"market exit rejected: {str(r)[:300]}"
         except Exception as e:  # noqa: BLE001 - timeout/reset => ambiguous
-            r, ok, err = None, False, str(e)[:300]
-            log.error("market exit ambiguous for %s (tag=%s): %s", sym, tag, e)
+            r, ok, err = None, False, sanitize_error_text(e, 300)
+            log.error("market exit ambiguous for %s (tag=%s): %s", sym, tag, sanitize_error_text(e))
             with self._lock:
                 syn.pop("_exit_placing", None)
                 syn["status"] = "ERRORED"
@@ -985,7 +1421,7 @@ class SyntheticEngine:
                 syn["exit_state"] = "BLOCKED"
                 # The order may be live; do not label it NAKED, but do alert.
                 syn["naked_position"] = False
-            log.error("EXIT AMBIGUOUS %s entry=%s tag=%s — will resolve by tag "
+            log.error("EXIT AMBIGUOUS %s entry=%s tag=%s - will resolve by tag "
                       "before any new exit", sym, entry_id, tag)
             return "ambiguous"
         with self._lock:
@@ -1070,7 +1506,7 @@ class SyntheticEngine:
         """Place the protective SL for a filled entry, exactly once.
 
         Strict fill gate (Plan 04 H3): the SL is placed ONLY when the entry is
-        genuinely filled — a positive average fill price must be available, from
+        genuinely filled - a positive average fill price must be available, from
         the feed frame or, if absent, fetched once via the broker's order
         history; it is never guessed from the planned entry. The SL is sized to
         the ACTUAL filled quantity. On a partial fill the SL covers the filled
@@ -1099,7 +1535,7 @@ class SyntheticEngine:
             entry_id = syn.get("entry_order_id")
             if syn.get("sl_placed") or syn.get("sl_order_id"):
                 # Already protected. Only react if the fill grew (a partial
-                # entry's remainder filled) — resize the SL so the added qty
+                # entry's remainder filled) - resize the SL so the added qty
                 # isn't left naked.
                 try:
                     covered = float(syn.get("sl_quantity") or 0)
@@ -1126,7 +1562,7 @@ class SyntheticEngine:
             try:
                 self.broker.modify_sl(sl_id, new_qty, stop, transaction_type=sl_txn)
             except Exception as e:
-                log.error("SL resize failed for %s: %s", sl_id, e)
+                log.error("SL resize failed for %s: %s", sl_id, sanitize_error_text(e))
                 return
             with self._lock:
                 syn["quantity"] = new_qty
@@ -1141,7 +1577,7 @@ class SyntheticEngine:
             try:
                 fill = self.broker.average_fill_price(str(entry_id))
             except Exception as e:
-                log.error("order history fill price for %s failed: %s", entry_id, e)
+                log.error("order history fill price for %s failed: %s", entry_id, sanitize_error_text(e))
                 fill = None
         try:
             fill = float(fill) if fill is not None else None
@@ -1151,10 +1587,10 @@ class SyntheticEngine:
             with self._lock:
                 syn["status"] = "ERRORED"
                 syn["error"] = ("entry complete but no fill price "
-                                "(feed + order history) — SL not placed")
+                                "(feed + order history) - SL not placed")
                 syn.pop("_sl_placing", None)
                 syn.pop("_preserve_sl", None)
-            log.error("entry %s (%s) complete with no fill price — NO SL placed",
+            log.error("entry %s (%s) complete with no fill price - NO SL placed",
                       sym, entry_id)
             return
 
@@ -1163,7 +1599,7 @@ class SyntheticEngine:
             # on the terminal frame is trusted as a full fill.
             filled = ordered
         if ordered and 0 < filled < ordered:
-            log.warning("partial fill for %s (%s): %s of %s filled — SL sized to "
+            log.warning("partial fill for %s (%s): %s of %s filled - SL sized to "
                         "the fill, remainder left working", sym, entry_id,
                         int(filled), int(ordered))
 
@@ -1177,7 +1613,7 @@ class SyntheticEngine:
                     if preserve.get(k) is not None:
                         syn[k] = preserve[k]
             else:
-                # stored distances (preferred) — fall back to deriving from plan
+                # stored distances (preferred) - fall back to deriving from plan
                 try:
                     target_dist = float(syn.get("target_points", 0) or 0)
                 except (TypeError, ValueError):
@@ -1222,9 +1658,9 @@ class SyntheticEngine:
             ok = bool(self._resp_ok(r) and r)
             err = str(r)[:300]
         except Exception as e:
-            r, t_sl, ok, err = None, int(time.time() * 1000), False, str(e)[:300]
+            r, t_sl, ok, err = None, int(time.time() * 1000), False, sanitize_error_text(e, 300)
             ambiguous = True
-            log.error("SL place ambiguous for %s (tag=%s): %s", sym, tag, e)
+            log.error("SL place ambiguous for %s (tag=%s): %s", sym, tag, sanitize_error_text(e))
         with self._lock:
             if ok:
                 placed = syn.get("placed_at_ms")
@@ -1331,7 +1767,7 @@ class SyntheticEngine:
                      max_cancels, delay)
         except Exception as e:  # noqa: BLE001 - StreamReset etc.; retry later
             log.error("SL cancel attempt %d/%d failed for %s: %s",
-                      attempts + 1, max_cancels, syn.get("trading_symbol"), e)
+                      attempts + 1, max_cancels, syn.get("trading_symbol"), sanitize_error_text(e))
         self._request_exit_poll(delay)
         return result
 
@@ -1493,13 +1929,13 @@ class SyntheticEngine:
                 with self._lock:
                     syn["both_filled"] = True
                     syn["late_exit_risk"] = True
-                log.critical("BOTH LEGS FILLED %s entry=%s SL=%s exit=%s — "
+                log.critical("BOTH LEGS FILLED %s entry=%s SL=%s exit=%s - "
                              "positions may be flipped; manual check required",
                              syn.get("trading_symbol"),
                              syn.get("entry_order_id"), sl_id, xid)
             elif xid:
                 log.error("LATE EXIT RISK %s: SL %s completed while exit %s "
-                          "was working — cancelling the exit",
+                          "was working - cancelling the exit",
                           syn.get("trading_symbol"), sl_id, xid)
                 self._safe_cancel(xid, "late SL complete")
             return "sl_hit"
@@ -1518,13 +1954,13 @@ class SyntheticEngine:
                             syn["exit_unknown_streak"] = 0
                             xid = ""
                         log.warning("FORCE EXIT %s: stale exit id %s absent from "
-                                    "book after %d confirmations — retrying once",
+                                    "book after %d confirmations - retrying once",
                                     syn.get("trading_symbol"), xid, streak)
                     else:
                         self._block_exit(
                             syn, "EXIT_UNKNOWN",
                             f"exit {xid} absent from {streak} consecutive book "
-                            "snapshots — state unknown; no automatic retry",
+                            "snapshots - state unknown; no automatic retry",
                             naked=True)
                         return "blocked"
                 else:
@@ -1558,7 +1994,7 @@ class SyntheticEngine:
                             syn["naked_position"] = False
                             xid = ""
                         log.warning("FORCE EXIT %s: cleared stale exit id %s "
-                                    "(%s) — placing exactly one replacement",
+                                    "(%s) - placing exactly one replacement",
                                     syn.get("trading_symbol"), xid, exit_st)
                     else:
                         reason = ("EXIT_REJECTED" if self._is_reject(exit_st)
@@ -1767,9 +2203,55 @@ class SyntheticEngine:
         errored: list[str] = []
         repaired: list[str] = []
         naked: list[str] = []
+        orphaned: list[str] = []
         now = int(time.time() * 1000)
         with self._lock:
             before = {id(s): s.get("status") for s in legs}
+            known_ids = set(self.orders)
+            for s in self.orders.values():
+                for k in ("sl_order_id", "exit_order_id"):
+                    if s.get(k):
+                        known_ids.add(str(s[k]))
+        # Plan 06 WP8: an unknown broker order carrying one of our tags must be
+        # adopted (pending entry / timed-out SL/exit) or explicitly orphaned -
+        # never silently ignored. This runs before the per-leg loop so a
+        # pre-registered entry can enter `orders` and still be driven this pass.
+        for od in book or []:
+            oid = str(od.get("nOrdNo") or "")
+            if not oid or oid in known_ids:
+                continue
+            tag = self._order_tag(od)
+            if not tag:
+                continue
+            with self._lock:
+                ours = self._is_our_tag_locked(tag)
+            if not ours:
+                continue
+            self.on_order_update(od, source="reconcile")
+            with self._lock:
+                adopted = self._by_any_id_locked(oid) is not None
+                # A tagged late exit for a CLOSED tracker belongs to that leg
+                # (the feed path just cancelled it once). It is a LATE EXIT RISK,
+                # not an orphan; only tags with no owning tracker are orphans.
+                owner = self._late_exit_owner_locked(tag)
+                handled = bool(owner is not None
+                               and owner.get("status") == "CLOSED")
+                if adopted:
+                    for s in self.orders.values():
+                        known_ids.add(str(s.get("entry_order_id") or ""))
+                        for k in ("sl_order_id", "exit_order_id"):
+                            if s.get(k):
+                                known_ids.add(str(s[k]))
+                elif not handled:
+                    self._record_orphan_locked(od, tag)
+            if not adopted and not handled and oid not in orphaned:
+                orphaned.append(oid)
+        # A tag adopted in the pre-loop must be driven in THIS pass, not only on
+        # the next reconcile. Refresh the tracker snapshot and baseline statuses.
+        with self._lock:
+            legs = list(self.orders.values())
+            for syn in legs:
+                before.setdefault(id(syn), syn.get("status"))
         for syn in legs:
             try:
                 status = syn.get("status")
@@ -1953,28 +2435,40 @@ class SyntheticEngine:
                         if not syn.get("late_exit_cancelled_ms"):
                             # Exactly one cancel attempt for a tagged late exit;
                             # if the book still echoes it, raise the risk alert
-                            # instead of spamming the broker forever.
+                            # instead of spamming the broker forever. The id is
+                            # recorded before the call (shared with the feed
+                            # tag-adoption path) so the same order is never
+                            # cancelled twice or reported as an orphan.
                             log.critical(
                                 "LATE EXIT RISK %s entry=%s: tagged exit %s "
                                 "(%s) is still working after CLOSED - cancel",
                                 syn.get("trading_symbol"),
                                 syn.get("entry_order_id"), late_id, late_st)
-                            with self._lock:
-                                syn["late_exit_risk"] = True
-                                syn["late_exit_cancelled_ms"] = int(
-                                    time.time() * 1000)
-                            self._safe_cancel(
-                                late_id, "late tagged exit after CLOSED")
+                            self._cancel_late_exit_once(
+                                syn, late_id, "late tagged exit after CLOSED")
                             driven.append(str(syn.get("entry_order_id") or ""))
-                        elif not syn.get("late_exit_risk"):
+                        elif syn.get("late_exit_risk"):
                             with self._lock:
-                                syn["late_exit_risk"] = True
-                            log.critical(
-                                "LATE EXIT RISK %s entry=%s: tagged exit %s "
-                                "still working after CLOSED — cancel already "
-                                "sent, MANUAL ACTION REQUIRED",
-                                syn.get("trading_symbol"),
-                                syn.get("entry_order_id"), late_id)
+                                streak = int(syn.get(
+                                    "late_exit_cancel_confirm_streak") or 0) + 1
+                                syn["late_exit_cancel_confirm_streak"] = streak
+                            need = max(2, int(settings.sl_missing_confirmations))
+                            if streak >= need:
+                                log.critical(
+                                    "LATE EXIT RISK %s entry=%s: tagged exit %s "
+                                    "still working after CLOSED - cancel was sent "
+                                    "but not confirmed; MANUAL ACTION REQUIRED "
+                                    "(%d/%d)", syn.get("trading_symbol"),
+                                    syn.get("entry_order_id"), late_id,
+                                    streak, need)
+                            else:
+                                log.warning(
+                                    "LATE EXIT RISK %s entry=%s: tagged exit %s "
+                                    "still working after CLOSED - cancel already "
+                                    "sent, awaiting confirmation (%d/%d)",
+                                    syn.get("trading_symbol"),
+                                    syn.get("entry_order_id"), late_id,
+                                    streak, need)
                     continue
                 if status == "PENDING_ENTRY":
                     eid = str(syn.get("entry_order_id") or "")
@@ -2043,7 +2537,7 @@ class SyntheticEngine:
                                 naked.append(sl)
                         else:
                             log.warning("reconcile: %s SL %s not in book yet "
-                                        "(miss %d/%d, grace %ss) — keeping leg %s",
+                                        "(miss %d/%d, grace %ss) - keeping leg %s",
                                         syn.get("trading_symbol"), sl, streak,
                                         settings.sl_missing_confirmations,
                                         settings.sl_visibility_grace_sec, status)
@@ -2160,7 +2654,7 @@ class SyntheticEngine:
                                 syn["sl_last_seen_ms"] = now
                                 syn["sl_replace_attempts"] = 0
                             driven.append(sl)
-                            log.info("reconcile: %s SL %s reappeared — leg restored to %s",
+                            log.info("reconcile: %s SL %s reappeared - leg restored to %s",
                                      syn.get("trading_symbol"), sl, syn.get("status"))
                 elif status == "CLOSING":
                     # Plan 06 WP5: a manual/external flatten during CLOSING must
@@ -2205,7 +2699,7 @@ class SyntheticEngine:
                 with self._lock:
                     syn["last_reconcile_ms"] = now
             except Exception as e:  # noqa: BLE001 - one bad leg must not stop others
-                log.error("reconcile leg err: %s", e)
+                log.error("reconcile leg err: %s", sanitize_error_text(e))
         # L6: several paths (on_order_update, drive_exit, external-flat) can
         # change a leg during this loop. Recompute the summary from the live
         # trackers so the UI/health never under-report ERRORED/naked legs.
@@ -2224,7 +2718,7 @@ class SyntheticEngine:
                     and sid and not any(i in naked for i in ids)):
                 naked.append(sid)
         return {"checked": len(legs), "driven": driven, "repaired": repaired,
-                "errored": errored, "naked": naked,
+                "errored": errored, "naked": naked, "orphaned": orphaned,
                 "positions": len(positions or {})}
 
     def _flat_confirmation(self, syn: dict) -> bool:
@@ -2403,7 +2897,7 @@ class SyntheticEngine:
                     syn["late_exit_risk"] = True
                     syn["late_exit_cancel_error_ms"] = now
                 log.critical("EXTERNAL FLAT %s entry=%s: could not cancel "
-                             "working exit %s — possible late fill, MANUAL "
+                             "working exit %s - possible late fill, MANUAL "
                              "ACTION REQUIRED",
                              syn.get("trading_symbol"),
                              syn.get("entry_order_id"), exit_id)
@@ -2419,7 +2913,7 @@ class SyntheticEngine:
             syn["exit_pending"] = False
             syn["exit_state"] = "BLOCKED"
             syn["position_flat_streak"] = 0
-        log.error("POSITION MISMATCH %s entry=%s: %s — no new SL placed",
+        log.error("POSITION MISMATCH %s entry=%s: %s - no new SL placed",
                   syn.get("trading_symbol"), syn.get("entry_order_id"), detail)
 
     def _request_entry_cancel(self, syn: dict, entry_id: str, now: int):
@@ -2486,7 +2980,7 @@ class SyntheticEngine:
             ok = self._resp_ok(r)
             err = None if ok else str(r)[:200]
         except Exception as e:  # noqa: BLE001 - retry within the budget
-            ok, err = False, str(e)[:200]
+            ok, err = False, sanitize_error_text(e, 200)
         with self._lock:
             if ok:
                 syn["entry_cancel_sent_ms"] = now
@@ -2522,7 +3016,7 @@ class SyntheticEngine:
                     ordered = 0.0
                 already = bool(syn.get("sl_placed") or syn.get("sl_order_id"))
             if not already:
-                log.error("SL GUARANTEE PARTIAL FILL %s entry=%s: %s filled — "
+                log.error("SL GUARANTEE PARTIAL FILL %s entry=%s: %s filled - "
                           "placing SL for the filled qty", syn.get("trading_symbol"),
                           entry_id, int(filled))
                 self._place_sl(syn, od)
@@ -2544,7 +3038,7 @@ class SyntheticEngine:
             syn["sl_guarantee_alerted"] = True
             syn["guarantee_alerted_at_ms"] = now
             syn["blocked_reason"] = "ENTRY_NOT_FILLED_SL_GUARANTEE"
-        log.error("SL GUARANTEE MISSED %s entry=%s after %ss (book=%s) — "
+        log.error("SL GUARANTEE MISSED %s entry=%s after %ss (book=%s) - "
                   "no protective SL yet (policy=%s)",
                   syn.get("trading_symbol"), entry_id,
                   settings.sl_guarantee_sec, st, behavior)
@@ -2573,7 +3067,7 @@ class SyntheticEngine:
             # auto-re-place the stop.
             self._mark_naked(
                 syn, "SL_CANCELLED_MANUAL",
-                f"SL {sl} was cancelled manually — position unprotected "
+                f"SL {sl} was cancelled manually - position unprotected "
                 "(automatic re-place suppressed)")
             with self._lock:
                 syn["manual_sl_cancel_pending"] = False
@@ -2612,7 +3106,7 @@ class SyntheticEngine:
             # naked position explicit, and never silently re-place the stop.
             self._mark_naked(
                 syn, "SL_CANCELLED_MANUAL",
-                f"SL {sl} was cancelled manually — position unprotected "
+                f"SL {sl} was cancelled manually - position unprotected "
                 "(automatic re-place suppressed)")
             with self._lock:
                 syn["manual_sl_cancel_pending"] = False
@@ -2640,7 +3134,7 @@ class SyntheticEngine:
                 syn["naked_position"] = False
                 syn["blocked_reason"] = None
                 syn.pop("error", None)
-            log.warning("reconcile: %s SL %s was %s — re-placed as %s",
+            log.warning("reconcile: %s SL %s was %s - re-placed as %s",
                         syn.get("trading_symbol"), sl, st,
                         syn.get("sl_order_id"))
             return "repaired"
@@ -2657,7 +3151,7 @@ class SyntheticEngine:
             # not downgrade to SL_MISSING/naked until the tag is confirmed
             # absent after the bounded retry/replace budget is spent.
             if not (absent and attempts >= limit):
-                log.warning("reconcile: %s replacement SL timed out (tag=%s) — "
+                log.warning("reconcile: %s replacement SL timed out (tag=%s) - "
                             "waiting for tag adoption before declaring naked",
                             syn.get("trading_symbol"), syn.get("sl_client_tag"))
                 return "skipped"
@@ -2665,7 +3159,7 @@ class SyntheticEngine:
                 syn["sl_ambiguous"] = False
         self._mark_naked(
             syn, "SL_MISSING" if st == "missing" else "SL_TERMINAL",
-            f"SL {sl} {st} on reconcile — position unprotected "
+            f"SL {sl} {st} on reconcile - position unprotected "
             f"(replace attempts={attempts}/{limit})")
         return "errored"
 
@@ -2697,7 +3191,7 @@ class SyntheticEngine:
             if strategy == "market_exit" and status == "ACTIVE":
                 hit = ltp >= target if side == "B" else ltp <= target
                 if hit:
-                    log.info("target hit %s @ %s — market exit",
+                    log.info("target hit %s @ %s - market exit",
                              syn["trading_symbol"], ltp)
                     syn["status"] = "CLOSING"
                     syn["exit_reason"] = "TARGET_EXIT"
@@ -2767,7 +3261,7 @@ class SyntheticEngine:
         except Exception as e:  # noqa: BLE001 - log and clear the echo marker
             with self._lock:
                 syn.pop("sl_app_modify_target", None)
-            log.error("trail modify failed: %s", e)
+            log.error("trail modify failed: %s", sanitize_error_text(e))
             return
         with self._lock:
             syn["stop_loss_price"] = new_sl

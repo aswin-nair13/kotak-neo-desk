@@ -1,3 +1,4 @@
+import re
 from pathlib import Path
 
 from pydantic import field_validator, model_validator
@@ -90,10 +91,27 @@ class Settings(BaseSettings):
     broker_call_timeout_sec: float = 10.0
     broker_stall_log_sec: float = 5.0  # log an ERROR when a command exceeds this
     worker_stop_timeout_sec: float = 5.0
+    # Duplicate-order protection (Plan 06 WP8): a timed-out/uncertain place is
+    # checked against the broker book by its deterministic client tag before a
+    # retry. This is the TOTAL attempts per placement (1 = never retry).
+    order_place_max_attempts: int = 2
+    # Bounded window for re-reading the order report after an ambiguous place.
+    # A single immediate read can miss a just-accepted order (book lag), which
+    # would otherwise allow a duplicate retry.
+    order_place_confirm_sec: float = 1.5
+    # Superseded/abandoned entry tags are retained so a late first-attempt order
+    # is adopted/alerted, never ignored. Bounded by age/count.
+    order_tag_ttl_sec: float = 21600.0
+    order_tag_registry_max: int = 1000
+    # Optional prefix for every generated client tag (entry/SL/exit). Empty keeps
+    # the legacy short tags (e.g. SE1-1) so existing adoption data still matches.
+    # Max 6 chars: action + unique ref tail + attempt must still fit Kotak's 20.
+    order_tag_prefix: str = ""
 
     @field_validator("sl_missing_confirmations", "flat_position_confirmations",
                      "entry_cancel_max_attempts",
-                     "closed_sl_cancel_max_attempts")
+                     "closed_sl_cancel_max_attempts",
+                     "order_place_max_attempts")
     @classmethod
     def _at_least_one_confirmation(cls, v: int) -> int:
         # A single snapshot/attempt is never enough for these safety gates.
@@ -115,6 +133,36 @@ class Settings(BaseSettings):
         if int(v) < 0:
             raise ValueError("attempt/retry counts must be >= 0")
         return int(v)
+
+    @field_validator("order_place_confirm_sec")
+    @classmethod
+    def _non_negative_confirm_window(cls, v: float) -> float:
+        if float(v) < 0:
+            raise ValueError("ORDER_PLACE_CONFIRM_SEC must be >= 0")
+        return float(v)
+
+    @field_validator("order_tag_ttl_sec")
+    @classmethod
+    def _positive_tag_ttl(cls, v: float) -> float:
+        if float(v) <= 0:
+            raise ValueError("ORDER_TAG_TTL_SEC must be > 0")
+        return float(v)
+
+    @field_validator("order_tag_registry_max")
+    @classmethod
+    def _positive_tag_registry(cls, v: int) -> int:
+        if int(v) < 1:
+            raise ValueError("ORDER_TAG_REGISTRY_MAX must be >= 1")
+        return int(v)
+
+    @field_validator("order_tag_prefix")
+    @classmethod
+    def _safe_tag_prefix(cls, v: str) -> str:
+        value = str(v or "")
+        if value and not re.fullmatch(r"[A-Za-z0-9_-]{1,6}", value):
+            raise ValueError(
+                "ORDER_TAG_PREFIX must be 0-6 chars: A-Z, a-z, 0-9, _ or -")
+        return value
 
     @field_validator("sl_guarantee_sec", "exit_confirm_timeout_sec",
                      "exit_confirm_poll_sec", "sl_visibility_grace_sec",

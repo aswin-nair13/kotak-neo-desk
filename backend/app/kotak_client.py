@@ -43,6 +43,44 @@ class ScripMasterError(RuntimeError):
     would let orders/streams resolve to no token (or, under MITM, a forged one)."""
 
 
+class BrokerDataError(RuntimeError):
+    """A market-data read failed (timeout/reset/bad shape).
+
+    Routes translate this into a structured 5xx. It must never be mistaken for
+    an authoritative empty result (e.g. a flat portfolio or a zero quote)."""
+
+
+_SECRET_KEY = (
+    r"(?:access[_-]?token|session[_-]?token|view[_-]?token|trade[_-]?token|"
+    r"token|session|sid|rid|authorization|password|mpin|totp|"
+    r"consumer[_-]?key|api[_-]?key|consumer[_-]?secret|api[_-]?secret|"
+    r"ucc|mobile)")
+_KV_SECRET_RE = re.compile(
+    r"(?i)(['\"]?\b" + _SECRET_KEY + r"\b['\"]?\s*[:=]\s*)"
+    r"(\"(?:\\.|[^\"\\])*\"|'(?:\\.|[^'\\])*'|[^\s,;&}\]]+)")
+_AUTH_BEARER_RE = re.compile(
+    r"(?i)\b(authorization\s*[:=]\s*)?bearer\s+[A-Za-z0-9._~+/=-]+")
+_JWT_RE = re.compile(
+    r"\beyJ[A-Za-z0-9_-]{5,}\.[A-Za-z0-9_-]{5,}\.[A-Za-z0-9_-]{5,}\b")
+
+
+def _redact_bearer(match: re.Match) -> str:
+    return f"{match.group(1) or 'Bearer '}<redacted>"
+
+
+def sanitize_error_text(value, limit: int = 240) -> str:
+    """One-line broker error text with credentials/account ids redacted.
+
+    Shared by every route/log surface. Handles bearer/JWT values and quoted or
+    unquoted key/value forms from JSON, Python dicts, headers and SDK errors.
+    """
+    s = str(value or "").replace("\n", " ").replace("\r", " ")
+    s = _AUTH_BEARER_RE.sub(_redact_bearer, s)
+    s = _KV_SECRET_RE.sub(lambda m: f"{m.group(1)}<redacted>", s)
+    s = _JWT_RE.sub("<redacted>", s)
+    return s[:limit]
+
+
 class KotakService:
     def __init__(self, consumer_key: str):
         self.consumer_key = consumer_key
@@ -59,7 +97,8 @@ class KotakService:
         # LTP cache: (exchange, symbol) -> (epoch_sec, ltp|None). Batch watchlist
         # polling refires every few seconds per leg; without this each poll is
         # N quote HTTP calls and Kotak answers 429 + dropped connections.
-        self._quote_cache: dict[tuple[str, str], tuple[float, float | None]] = {}
+        self._quote_cache: dict[
+            tuple[str, str], tuple[float, float | None, str | None]] = {}
         self.quote_ttl_sec: float = 8.0
 
     # ---------- session ----------
@@ -79,7 +118,7 @@ class KotakService:
 
     @staticmethod
     def _assert_session_ok(resp, step: str):
-        """v3 totp calls return error dicts instead of raising — a bad/stale TOTP
+        """v3 totp calls return error dicts instead of raising - a bad/stale TOTP
         would otherwise look like a live session until the first order 401s."""
         if isinstance(resp, dict) and isinstance(resp.get("data"), dict):
             return resp["data"]
@@ -91,7 +130,7 @@ class KotakService:
 
     @staticmethod
     def _summarize(resp) -> str:
-        """Safe one-line summary for logs — keys and status flags only, never tokens."""
+        """Safe one-line summary for logs - keys and status flags only, never tokens."""
         if not isinstance(resp, dict):
             return f"non-dict {type(resp).__name__}"
         d = resp.get("data")
@@ -113,7 +152,7 @@ class KotakService:
         log.info("totp_validate %s", self._summarize(r2))
         data = self._assert_session_ok(r2, "MPIN validation (check KOTAK_MPIN in .env)")
         # data.status can be "failed" even with a data body (e.g. expired password,
-        # unaccepted risk disclosure) — tokens from such a session are rejected by OMS.
+        # unaccepted risk disclosure) - tokens from such a session are rejected by OMS.
         if str(data.get("status", "success")).lower() != "success":
             raise RuntimeError(
                 f"Login not completed (status={data.get('status')}). "
@@ -122,14 +161,14 @@ class KotakService:
                 "Check the NEO app for pending password change / disclosures / KYC.")
         cfg = getattr(getattr(self.pending_client, "api_client", None), "configuration", None)
         if not getattr(cfg, "edit_token", None):
-            raise RuntimeError("MPIN validation returned no trading token — login incomplete")
+            raise RuntimeError("MPIN validation returned no trading token - login incomplete")
         self.client = self.pending_client
         self.pending_client = None
         self.login_date = date.today()
         self.nse_fo_tokens = self._load_master("nse_fo")
         self.bse_fo_tokens = self._load_master("bse_fo")
         if self.master_errors:
-            log.error("Kotak login OK but scrip master unavailable (%s) — trading "
+            log.error("Kotak login OK but scrip master unavailable (%s) - trading "
                       "disabled until a successful refresh", self.master_errors)
         else:
             log.info("Kotak login OK; scrip masters cached: NFO=%d BFO=%d",
@@ -138,7 +177,7 @@ class KotakService:
 
     def _require(self):
         if not self.logged_in or self.client is None:
-            raise RuntimeError("Kotak session expired — login again (TOTP)")
+            raise RuntimeError("Kotak session expired - login again (TOTP)")
         return self.client
 
     # ---------- masters ----------
@@ -170,7 +209,7 @@ class KotakService:
     def _scrip_master(self, segment: str) -> dict[str, str]:
         """Download + parse one segment's scrip master. TLS is always verified:
         the default trust store, or an explicit CA bundle via
-        SCRIP_MASTER_CA_BUNDLE. raises ScripMasterError on any failure — the
+        SCRIP_MASTER_CA_BUNDLE. raises ScripMasterError on any failure - the
         caller must not proceed with an empty symbol->token map."""
         client = self._require()
         verify = settings.scrip_master_ca_bundle or True
@@ -183,8 +222,8 @@ class KotakService:
             df = pd.read_csv(io.StringIO(resp.text), dtype=str).fillna("")
             out = dict(zip(df["pTrdSymbol"], df["pSymbol"]))
         except Exception as e:
-            log.error("scrip master %s failed (verify=%s): %s", segment, verify, e)
-            raise ScripMasterError(f"{segment}: {e}") from e
+            log.error("scrip master %s failed (verify=%s): %s", segment, verify, sanitize_error_text(e))
+            raise ScripMasterError(f"{segment}: {sanitize_error_text(e)}") from e
         if segment == "nse_fo":
             self.nse_fo_df = df
         else:
@@ -197,7 +236,7 @@ class KotakService:
         try:
             return self._scrip_master(segment)
         except ScripMasterError as e:
-            self.master_errors[segment] = str(e)
+            self.master_errors[segment] = sanitize_error_text(e)
             return {}
 
     def refresh_masters(self) -> dict:
@@ -212,7 +251,7 @@ class KotakService:
         """True only when the session is live and both scrip masters resolved.
 
         Orders derive their instrument_token from these maps, so a missing/empty
-        map means orders would resolve to no token — trading must be blocked."""
+        map means orders would resolve to no token - trading must be blocked."""
         return (self.logged_in and not self.master_errors
                 and bool(self.nse_fo_tokens) and bool(self.bse_fo_tokens))
 
@@ -319,7 +358,7 @@ class KotakService:
     def place_market_exit(self, exchange_segment: str, quantity: str, trading_symbol: str,
                           transaction_type: str = "S", product: str = "MIS",
                           tag: str | None = None):
-        # MKT legs must carry price "0" — an empty string is rejected by OMS
+        # MKT legs must carry price "0" - an empty string is rejected by OMS
         # (this silently killed every synthetic target-exit and Exit-button
         # flatten: order accepted then never fills / rejected downstream).
         return self.place_order(exchange_segment=exchange_segment, product=product,
@@ -329,7 +368,7 @@ class KotakService:
 
     def modify_sl(self, order_id: str, quantity: str, new_trigger: str,
                   transaction_type: str = "S"):
-        """v3 modify_order REQUIRES quantity — pass the leg's original qty."""
+        """v3 modify_order REQUIRES quantity - pass the leg's original qty."""
         client = self._require()
         trig = max(0.05, float(new_trigger))
         limit = self.sl_limit_price(trig, transaction_type)
@@ -344,9 +383,13 @@ class KotakService:
         client = self._require()
         return client.cancel_order(order_id=str(order_id))
 
+    def order_report(self):
+        """Full day order report (v3). Used to adopt a timed-out placement by tag."""
+        return self._require().order_report()
+
     def order_book(self):
         """Full day order book (v3: order_report; order_history needs one order_id)."""
-        return self._require().order_report()
+        return self.order_report()
 
     def order_history(self, order_id: str):
         return self._require().order_history(order_id=str(order_id))
@@ -361,7 +404,7 @@ class KotakService:
         try:
             res = self.order_history(order_id)
         except Exception as e:
-            log.error("order_history %s failed: %s", order_id, e)
+            log.error("order_history %s failed: %s", order_id, sanitize_error_text(e))
             return None
         rows = res.get("data") if isinstance(res, dict) else res
         if isinstance(rows, dict):
@@ -386,54 +429,66 @@ class KotakService:
         try:
             res = self._require().limits()
         except Exception as e:
-            return {"ok": False, "detail": str(e)[:300]}
+            return {"ok": False, "detail": sanitize_error_text(e, 300)}
         if isinstance(res, dict) and res.get("stat") == "Ok":
             return {"ok": True}
-        return {"ok": False, "detail": str(res)[:300]}
+        return {"ok": False, "detail": sanitize_error_text(res, 300)}
 
     def egress_ip(self) -> dict:
         """The public IP Kotak sees for this session (SDK whatsmyip, needs 2FA).
 
         Since 1-Apr-2026 Kotak enforces static-IP whitelisting on ORDER APIs only:
         this IP must be a whitelisted static IPv4, and the session must have been
-        created from it — otherwise orders fail with stCode 100008 while every
+        created from it - otherwise orders fail with stCode 100008 while every
         read API keeps working.
         """
         try:
             res = self._require().whatsmyip()
         except Exception as e:
-            return {"ip": None, "detail": str(e)[:200]}
+            return {"ip": None, "detail": sanitize_error_text(e, 200)}
         try:
             ip = res["data"][0]["ip"]
             return {"ip": ip, "raw": res}
         except (KeyError, IndexError, TypeError):
             return {"ip": None, "detail": str(res)[:200]}
 
-    def quote_ltp(self, trading_symbol: str, exchange: str) -> float | None:
-        """Live LTP for one F&O symbol via v3 quotes(). Returns None on any failure.
-        Results (including misses) are cached for quote_ttl_sec so UI polling
-        bursts don't trip Kotak's rate limiter."""
+    def quote_ltp(self, trading_symbol: str, exchange: str,
+                  strict: bool = False) -> float | None:
+        """Live LTP for one F&O symbol via v3 quotes().
+
+        Returns None on failure by default (legacy callers). `strict=True` raises
+        `BrokerDataError` with the sanitized real error instead, so a route can
+        return 502/stale rather than a blank/zero price. Results (including
+        misses) are cached for quote_ttl_sec so UI polling bursts don't trip
+        Kotak's rate limiter.
+        """
         key = (exchange, trading_symbol)
         now = time.time()
         hit = self._quote_cache.get(key)
         if hit is not None and now - hit[0] < self.quote_ttl_sec:
-            return hit[1]
-        ltp = self._quote_ltp_live(trading_symbol, exchange)
-        self._quote_cache[key] = (now, ltp)
+            ltp, err = hit[1], hit[2]
+        else:
+            ltp, err = self._quote_ltp_live(trading_symbol, exchange)
+            self._quote_cache[key] = (now, ltp, err)
+        if ltp is None and strict:
+            raise BrokerDataError(err or f"no quote for {trading_symbol}")
         return ltp
 
-    def _quote_ltp_live(self, trading_symbol: str, exchange: str) -> float | None:
+    def _quote_ltp_live(self, trading_symbol: str,
+                        exchange: str) -> tuple[float | None, str | None]:
         tok = self.token_for(trading_symbol, exchange)
         if not tok:
-            log.warning("quote: no token for %s", trading_symbol)
-            return None
+            err = f"no instrument token for {trading_symbol}"
+            log.warning("quote: %s", err)
+            return None, err
         try:
             res = self._require().quotes(
                 instrument_tokens=[{"instrument_token": str(tok), "exchange_segment": exchange}])
         except Exception as e:
-            log.error("quote %s failed: %s", trading_symbol, e)
-            return None
-        # Defensive parse — backend shape varies; try common containers/keys.
+            err = f"quote request failed: {sanitize_error_text(e)}"
+            log.error("quote %s failed: %s", trading_symbol, sanitize_error_text(e))
+            return None, err
+        # Defensive parse - backend shape varies; try common containers/keys.
         cands: list = []
         if isinstance(res, dict):
             data = res.get("data", res)
@@ -446,11 +501,13 @@ class KotakService:
             for k in ("ltp", "iv", "lastTradedPrice", "lastPrice", "c", "close"):
                 try:
                     if c.get(k) not in (None, ""):
-                        return float(c[k])
+                        return float(c[k]), None
                 except (TypeError, ValueError):
                     continue
-        log.warning("quote: no LTP parsed for %s: %s", trading_symbol, str(res)[:200])
-        return None
+        detail = sanitize_error_text(res, 200)
+        err = f"broker returned no usable LTP for {trading_symbol}: {detail}"
+        log.warning("quote: no LTP parsed for %s: %s", trading_symbol, detail)
+        return None, err
 
     # ---------- positions (same aggregation as TransTrader.get_positions) ----------
     def positions(self, strict: bool = False) -> dict:
@@ -463,15 +520,21 @@ class KotakService:
         try:
             raw = self._require().positions()
         except Exception as e:
-            log.error("positions call failed: %s", e)
+            detail = sanitize_error_text(e)
+            log.error("positions call failed: %s", detail)
             if strict:
-                raise
+                raise BrokerDataError(
+                    f"positions request failed: {detail}") from e
             return {}
         if not isinstance(raw, dict) or raw.get("stCode") != 200:
+            detail = sanitize_error_text(raw, 200)
+            log.error("positions response unusable: %s", detail)
             if strict:
-                raise RuntimeError(f"positions failed: {str(raw)[:200]}")
+                raise BrokerDataError(f"positions failed: {detail}")
             return {}
         if not raw.get("data"):
+            # A successful `data: []` is an authoritative flat snapshot; callers
+            # that need to distinguish it from an error get {} only here.
             return {}
         df = pd.DataFrame(raw["data"])
         num_cols = ["cfBuyQty", "flBuyQty", "cfSellQty", "flSellQty", "cfBuyAmt", "buyAmt",

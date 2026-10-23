@@ -174,7 +174,7 @@ class SessionKotak:
     def order_book(self):
         return {"data": []}
 
-    def positions(self):
+    def positions(self, strict=False):
         return {}
 
 

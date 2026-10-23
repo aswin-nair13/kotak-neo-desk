@@ -110,6 +110,7 @@ def health():
                               if o.get("naked_position") and not o.get("exit_pending")]),
             "blocked_legs": len([o for o in legs if o.get("blocked_reason")]),
             "errored_legs": len([o for o in legs if o["status"] == "ERRORED"]),
+            "entry_intents": engine.entry_intent_health(),
             "order_age_ms": feed.get("order_age_ms"),
             "tick_age_ms": feed.get("tick_age_ms"),
             "last_reconcile_ms": feed.get("last_reconcile_ms"),

@@ -15,6 +15,7 @@ from datetime import datetime, timedelta, timezone
 
 from .broker_worker import CommandWorker
 from .config import settings
+from .kotak_client import sanitize_error_text
 
 log = logging.getLogger("sfeed")
 
@@ -389,7 +390,7 @@ class SFeedBridge:
             try:
                 self._schedule_reconcile("periodic")
             except Exception as e:  # noqa: BLE001 - scheduler must survive one bad tick
-                log.error("periodic reconcile schedule failed: %s", e)
+                log.error("periodic reconcile schedule failed: %s", sanitize_error_text(e))
 
     def _schedule_reconcile(self, source: str, force: bool = False) -> bool:
         """Queue a reconcile without blocking; at most one pending/running.
@@ -487,7 +488,7 @@ class SFeedBridge:
                     try:
                         note()
                     except Exception as e:  # noqa: BLE001
-                        log.error("book-unavailable accounting failed: %s", e)
+                        log.error("book-unavailable accounting failed: %s", sanitize_error_text(e))
                 return
             try:
                 try:
@@ -501,7 +502,7 @@ class SFeedBridge:
             except Exception as e:  # noqa: BLE001
                 self._last_reconcile_error = f"apply:{type(e).__name__}"
                 self._last_reconcile_error_ms = _now_ms()
-                log.error("reconcile apply failed: %s", e)
+                log.error("reconcile apply failed: %s", sanitize_error_text(e))
                 return
             done = _now_ms()
             self._last_reconcile_ms = done
@@ -600,7 +601,7 @@ class SFeedBridge:
         try:
             loop.run_until_complete(self._supervise())
         except Exception as e:
-            log.error("bridge loop died: %s", e)
+            log.error("bridge loop died: %s", sanitize_error_text(e))
         finally:
             self._loop = None
 
@@ -635,7 +636,7 @@ class SFeedBridge:
             except asyncio.CancelledError:
                 raise
             except Exception as e:
-                log.error("market session ended: %s", e)
+                log.error("market session ended: %s", sanitize_error_text(e))
             if not self._stop.is_set():
                 await asyncio.sleep(self.retry_sec)
 
@@ -646,7 +647,7 @@ class SFeedBridge:
             except asyncio.CancelledError:
                 raise
             except Exception as e:
-                log.error("order session ended: %s", e)
+                log.error("order session ended: %s", sanitize_error_text(e))
             if not self._stop.is_set():
                 await asyncio.sleep(self.retry_sec)
 
@@ -777,7 +778,7 @@ class SFeedBridge:
             raw = self.kotak.order_book()
             book_rows, book_ok = parse_order_book(raw)
         except Exception as e:
-            log.error("reconcile order_book failed: %s", e)
+            log.error("reconcile order_book failed: %s", sanitize_error_text(e))
         self._last_book_ms = _now_ms()
         self._last_book_ok = book_ok
         book = [m for m in (map_book_entry(r) for r in book_rows) if m]
@@ -793,16 +794,12 @@ class SFeedBridge:
         """
         book, book_ok = self.fetch_book()
         try:
-            try:
-                positions = self.kotak.positions(strict=True) or {}
-            except TypeError:
-                # Older/custom broker doubles only accept positions().
-                positions = self.kotak.positions() or {}
+            positions = self.kotak.positions(strict=True) or {}
             self._last_positions_ok = True
             self._last_positions_ms = _now_ms()
             self._last_positions_error = None
         except Exception as e:
-            log.error("reconcile positions failed: %s", e)
+            log.error("reconcile positions failed: %s", sanitize_error_text(e))
             positions = {}
             self._last_positions_ok = False
             self._last_positions_ms = _now_ms()
@@ -824,19 +821,19 @@ class SFeedBridge:
                 self._subscribed.update(wanted)
             log.info("subscribed %d scrips", len(toks))
         except Exception as e:
-            log.error("subscribe failed: %s", e)
+            log.error("subscribe failed: %s", sanitize_error_text(e))
 
     def _apply_tick(self, tick: dict):
         try:
             self.engine.on_tick(tick)
         except Exception as e:
-            log.error("tick handle err: %s", e)
+            log.error("tick handle err: %s", sanitize_error_text(e))
 
     def _apply_order_update(self, od: dict):
         try:
             self.engine.on_order_update(od)
         except Exception as e:
-            log.error("engine order err: %s", e)
+            log.error("engine order err: %s", sanitize_error_text(e))
         finally:
             now = _now_ms()
             self._last_order_applied_ms = now
@@ -866,4 +863,4 @@ class SFeedBridge:
         try:
             asyncio.run_coroutine_threadsafe(self.hub.broadcast(msg), loop)
         except Exception as e:
-            log.error("push err: %s", e)
+            log.error("push err: %s", sanitize_error_text(e))

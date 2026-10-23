@@ -80,6 +80,9 @@ class ExitBody(BaseModel):
     # product defaults to the tracked leg's product (or broker position's),
     # override only if you moved the position across products.
     product: str | None = None
+    # Optional per-click idempotency key. The server also dedupes by symbol for
+    # a short window, so a double-click cannot send two manual exit orders.
+    client_order_tag: str | None = Field(default=None, max_length=64)
 
 
 class ForceExitBody(BaseModel):

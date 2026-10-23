@@ -613,7 +613,7 @@ def test_force_exit_on_closed_leg_without_exit_id_is_success(fast_exit, monkeypa
     assert broker.place_calls == 0
 
 
-def test_reconcile_cancels_tagged_working_exit_for_closed(fast_exit):
+def test_reconcile_cancels_tagged_working_exit_for_closed(fast_exit, caplog):
     clock = FakeClock()
     row = _book_order("X9", st="open")
     row["guiOrdId"] = "XE1-1"
@@ -622,10 +622,37 @@ def test_reconcile_cancels_tagged_working_exit_for_closed(fast_exit):
     engine = _engine(broker, clock)
     engine.add(_leg(status="CLOSED", exit_order_id=None, exit_client_tag="XE1-1",
                     exit_pending=False))
+    caplog.set_level(logging.WARNING)
 
     engine.reconcile(book, {}, positions_ok=True)
     leg = engine.orders["E1"]
     assert leg["status"] == "CLOSED"
     assert leg["late_exit_risk"] is True
-    assert broker.cancel_calls == ["X9"]
+    assert broker.cancel_calls == ["X9"]          # exactly once across both paths
     assert broker.place_calls == 0
+    assert "X9" in (leg.get("cancel_requested_ids") or {})
+    messages = [r.message for r in caplog.records]
+    assert any("LATE EXIT RISK" in m for m in messages)
+    assert not any("ORPHAN TAGGED ORDER" in m for m in messages)
+
+    # A second reconcile while the book still echoes the stale order must not
+    # cancel it again (bounded alert only).
+    engine.reconcile(book, {}, positions_ok=True)
+    assert broker.cancel_calls == ["X9"]
+
+def test_ambiguous_exit_log_redacts_credentials(caplog):
+    class LeakyBroker(ExitBroker):
+        def place_market_exit(self, exchange, qty, symbol, **kwargs):
+            raise RuntimeError(
+                "trade_token=super-secret sessionToken=st-raw totp=123456")
+
+    clock = FakeClock()
+    broker = LeakyBroker([_book_order("SL1", st="cancelled")])
+    engine = _engine(broker, clock)
+    engine.add(_leg(status="ACTIVE"))
+    caplog.set_level(logging.ERROR)
+
+    assert engine._place_exit(engine.orders["E1"]) == "ambiguous"
+    assert "super-secret" not in caplog.text
+    assert "st-raw" not in caplog.text
+    assert "123456" not in caplog.text
