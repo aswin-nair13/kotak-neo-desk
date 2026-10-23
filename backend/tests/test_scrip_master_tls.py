@@ -28,6 +28,21 @@ class _Resp:
         return None
 
 
+class _MonthlyResp:
+    # Includes weekly (25N18, 25D18) and monthly (25NOV) codes plus the
+    # pExpiryDate column the real master's CSV carries. Epochs are ordered
+    # 25N18 < 25NOV < 25D18, so a lexical sort (D < N) would be wrong.
+    text = (
+        "pTrdSymbol,pSymbol,pExpiryDate\n"
+        "NIFTY25N1825450CE,1,1763500000\n"
+        "NIFTY25NOV25000CE,2,1764000000\n"
+        "NIFTY25D1825000CE,3,1766000000\n"
+    )
+
+    def raise_for_status(self):
+        return None
+
+
 @pytest.fixture()
 def svc():
     s = KotakService(consumer_key="dummy")
@@ -98,6 +113,25 @@ def test_master_ok_when_both_load(svc, monkeypatch):
     s.bse_fo_tokens = s._load_master("bse_fo")
     assert s.master_ok
     assert s.master_status()["ok"] is True
+
+
+def test_monthly_expiries_and_strikes_are_visible(svc, monkeypatch):
+    s, _ = svc
+    monkeypatch.setattr(kotak_client.requests, "get", lambda *a, **kw: _MonthlyResp())
+    s.nse_fo_tokens = s._load_master("nse_fo")
+    s.bse_fo_tokens = s._load_master("bse_fo")
+    assert s.expiries("NIFTY") == ["25N18", "25NOV", "25D18"]
+    assert s.master_strikes("NIFTY", "25NOV", "CE") == ["25000"]
+
+
+def test_expiries_fall_back_to_code_order_without_master_df():
+    s = KotakService(consumer_key="dummy")
+    s.nse_fo_tokens = {
+        "NIFTY25D1825000CE": "1",
+        "NIFTY25NOV25000CE": "2",
+        "NIFTY25N1825450CE": "3",
+    }
+    assert s.expiries("NIFTY") == ["25N18", "25NOV", "25D18"]
 
 
 def test_refresh_masters_clears_prior_error(svc, monkeypatch):

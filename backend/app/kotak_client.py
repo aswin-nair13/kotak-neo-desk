@@ -142,10 +142,30 @@ class KotakService:
         return self.client
 
     # ---------- masters ----------
-    # Trading symbols look like NIFTY25N1825450CE = <UNDERLYING><EXPIRY><STRIKE><CE|PE>.
-    # Expiry segment (e.g. 25N18) is extracted via regex so the UI can offer a
-    # dropdown instead of a hardcoded value.
-    _SYM_RE = re.compile(r"^(NIFTY|SENSEX|BANKNIFTY|FINNIFTY)(\d{2}[A-Z]\d{2})(\d+)(CE|PE|XX|CF|PF)$")
+    # Trading symbols look like NIFTY25N1825450CE (weekly) or NIFTY25NOV26000CE
+    # (monthly) = <UNDERLYING><EXPIRY><STRIKE><CE|PE>. Weekly expiry is
+    # YY + first letter of month + DD (25N18); monthly is YY + MMM (25NOV).
+    # Both are extracted via regex so the UI can offer a dropdown instead of a
+    # hardcoded value.
+    _MONTHS = ("JAN", "FEB", "MAR", "APR", "MAY", "JUN",
+               "JUL", "AUG", "SEP", "OCT", "NOV", "DEC")
+    _SYM_RE = re.compile(
+        r"^(NIFTY|SENSEX|BANKNIFTY|FINNIFTY)"
+        r"(\d{2}(?:[A-Z]{3}|[A-Z]\d{2}))"
+        r"(\d+)(CE|PE|XX|CF|PF)$")
+
+    @classmethod
+    def _expiry_sort_key(cls, code: str) -> tuple[int, int, int]:
+        """Chronological fallback key for an expiry code (no master dates)."""
+        year = 2000 + int(code[:2])
+        if code[2:].isalpha():  # monthly: YY + MMM, expires after that month's weeklies
+            month = cls._MONTHS.index(code[2:]) + 1 if code[2:] in cls._MONTHS else 0
+            day = 31
+        else:  # weekly: YY + month initial + DD
+            month = next((i for i, m in enumerate(cls._MONTHS, 1)
+                          if m.startswith(code[2])), 0)
+            day = int(code[3:])
+        return (year, month, day)
 
     def _scrip_master(self, segment: str) -> dict[str, str]:
         """Download + parse one segment's scrip master. TLS is always verified:
@@ -205,13 +225,37 @@ class KotakService:
         return m.get(trading_symbol)
 
     def expiries(self, instrument: str) -> list[str]:
-        """Sorted unique expiry codes (e.g. ['25N18', '25D24']) for an underlying."""
-        codes: set[str] = set()
-        for sym in list(self.nse_fo_tokens) + list(self.bse_fo_tokens):
-            m = self._SYM_RE.match(sym)
-            if m and m.group(1) == instrument:
-                codes.add(m.group(2))
-        return sorted(codes)
+        """Sorted unique expiry codes (e.g. ['25N18', '25NOV']) for an underlying.
+
+        Both weekly (YY + month initial + DD) and monthly (YY + MMM) codes are
+        accepted. Ordering uses the master's pExpiryDate when available so the
+        two forms interleave chronologically (lexical sort misorders them across
+        month boundaries); otherwise it falls back to parsing the code."""
+        found: dict[str, float] = {}
+        for df in (self.nse_fo_df, self.bse_fo_df):
+            if df is None or "pTrdSymbol" not in df.columns:
+                continue
+            sub = df[df["pTrdSymbol"].astype(str).str.startswith(instrument)]
+            whens = sub["pExpiryDate"] if "pExpiryDate" in sub.columns else [0] * len(sub)
+            for sym, when in zip(sub["pTrdSymbol"], whens):
+                m = self._SYM_RE.match(str(sym))
+                if not m or m.group(1) != instrument:
+                    continue
+                try:
+                    expiry_ms = float(when)
+                    if not expiry_ms > 0:  # NaN or empty from a missing CSV cell
+                        expiry_ms = 0.0
+                except (TypeError, ValueError):
+                    expiry_ms = 0.0
+                code = m.group(2)
+                found[code] = min(expiry_ms, found.get(code, expiry_ms))
+        if not found:
+            # Callers that populated only the token maps (e.g. tests/snapshots).
+            for sym in list(self.nse_fo_tokens) + list(self.bse_fo_tokens):
+                m = self._SYM_RE.match(sym)
+                if m and m.group(1) == instrument:
+                    found[m.group(2)] = 0.0
+        return sorted(found, key=lambda c: (found[c], self._expiry_sort_key(c)))
 
     def master_strikes(self, instrument: str, expiry: str, option_type: str) -> list[str]:
         """Actual strikes listed in the scrip master for instrument+expiry, numeric sort."""
