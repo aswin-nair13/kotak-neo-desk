@@ -374,6 +374,9 @@ def test_duplicate_tag_never_double_tracks_or_silently_drops(monkeypatch, caplog
 
 
 def test_registration_collision_checks_existing_tracker_tag(monkeypatch):
+    # The existing ACTIVE leg deliberately shares the symbol; allow stacking so
+    # this test exercises tag-collision handling (WP11 blocks it by default).
+    monkeypatch.setattr(settings, "allow_stacked_entries", True)
     broker = TagBroker()
     engine = _wire(monkeypatch, broker)
     engine.add({"entry_order_id": "OLD", "sl_order_id": "SL0",

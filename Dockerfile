@@ -8,6 +8,11 @@ RUN npm run build
 
 FROM ghcr.io/astral-sh/uv:python3.12-bookworm-slim AS be
 WORKDIR /srv
+# docker-compose pins TZ=Asia/Kolkata for IST logs; the slim base omits the
+# timezone database, so install it explicitly.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends tzdata \
+    && rm -rf /var/lib/apt/lists/*
 ENV UV_FROZEN=1 UV_NO_DEV=1
 COPY backend/pyproject.toml backend/uv.lock ./backend/
 RUN --mount=type=cache,target=/root/.cache/uv \

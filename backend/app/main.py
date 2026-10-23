@@ -10,7 +10,7 @@ import logging
 from contextlib import asynccontextmanager
 from pathlib import Path
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, Response, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
@@ -26,6 +26,9 @@ from .synthetic_engine import SyntheticEngine
 from .ws_manager import Hub
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
+# Log timestamps are local wall-clock time of the server process. Docker compose
+# pins TZ=Asia/Kolkata so container logs match IST and the engine's time.time()
+# epochs; if you run outside Docker set TZ explicitly.
 log = logging.getLogger("startup")
 
 if not settings.app_password_bcrypt:
@@ -104,18 +107,43 @@ def health():
     feed = bridge.health()
     w = feed.get("worker", {})
     legs = engine.all()
+    open_legs = [o for o in legs if o["status"] != "CLOSED"]
+    naked = [o for o in open_legs
+             if o.get("naked_position") and not o.get("exit_pending")]
+    errored = [o for o in open_legs if o["status"] == "ERRORED"]
+    # /api/health is reachable without a user JWT (IP allowlist only), so it
+    # must never expose broker order ids. Counts are enough for the UI/banner.
+    feed = dict(feed)
+    summary = feed.get("last_reconcile")
+    if isinstance(summary, dict):
+        feed["last_reconcile"] = {
+            k: (len(v) if isinstance(v, list) else v)
+            for k, v in summary.items()}
+    intents = engine.entry_intent_health()
+    for rows in intents.values():
+        if not isinstance(rows, list):
+            continue
+        for row in rows:
+            if isinstance(row, dict):
+                row.pop("entry_order_id", None)
+                row.pop("superseded_by", None)
     return {"ok": True, "build": BUILD, "kotak_logged_in": kotak.logged_in,
-            "synthetic_open": len([o for o in legs if o["status"] not in ("CLOSED",)]),
-            "naked_legs": len([o for o in legs
-                              if o.get("naked_position") and not o.get("exit_pending")]),
+            "synthetic_open": len(open_legs),
+            "open_legs": len(open_legs),
+            "naked_legs": len(naked),
             "blocked_legs": len([o for o in legs if o.get("blocked_reason")]),
-            "errored_legs": len([o for o in legs if o["status"] == "ERRORED"]),
-            "entry_intents": engine.entry_intent_health(),
+            "errored_legs": len(errored),
+            "entry_intents": intents,
             "order_age_ms": feed.get("order_age_ms"),
             "tick_age_ms": feed.get("tick_age_ms"),
+            "feed_order_age_ms": feed.get("order_age_ms"),
+            "feed_tick_age_ms": feed.get("tick_age_ms"),
+            "feed_stale": feed.get("feed_stale"),
+            "feed_stale_age_ms": feed.get("feed_stale_age_ms"),
             "last_reconcile_ms": feed.get("last_reconcile_ms"),
             "last_reconcile_ok_ms": feed.get("last_reconcile_ok_ms"),
             "last_reconcile_error": feed.get("last_reconcile_error"),
+            "last_reconcile": feed.get("last_reconcile"),
             "last_positions_ms": feed.get("last_positions_ms"),
             "last_positions_ok": feed.get("last_positions_ok"),
             "last_positions_error": feed.get("last_positions_error"),
@@ -176,6 +204,16 @@ async def ws_feed(ws: WebSocket):
         pass
     finally:
         await hub.unregister(ws)
+
+
+@app.get("/favicon.ico", include_in_schema=False)
+def favicon():
+    """Browsers request /favicon.ico by default; answer instead of a 404.
+
+    The SPA also links an inline SVG favicon (frontend/index.html), so this is
+    only a quiet fallback for cached/legacy requests.
+    """
+    return Response(status_code=204)
 
 
 # prod: serve React build

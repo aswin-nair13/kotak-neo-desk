@@ -51,6 +51,12 @@ class Settings(BaseSettings):
     # Conservative idle fallback when the SDK exposes no connection signal.
     feed_idle_reconnect_sec: float = 300.0
     reconcile_sec: float = 30.0        # periodic broker reconcile interval
+    # Watchlist subscription coalescing (Plan 06 WP9). Identical per-session
+    # watch requests are dropped; rapid changes are merged and applied once.
+    watch_min_interval_ms: int = 500
+    # Browser tabs that disappear without unwatch (reload/crash/network loss)
+    # are pruned after this long without a watch/heartbeat call.
+    watch_session_ttl_sec: float = 900.0
     # Reconcile safety: never treat one missing SL as proof it is gone.
     sl_visibility_grace_sec: float = 10.0
     sl_missing_confirmations: int = 2
@@ -108,6 +114,18 @@ class Settings(BaseSettings):
     # Max 6 chars: action + unique ref tail + attempt must still fit Kotak's 20.
     order_tag_prefix: str = ""
 
+    # Entry/placement hygiene (Plan 06 WP11).
+    # Block a second working bracket on the same symbol by default; an operator
+    # may explicitly opt in with ALLOW_STACKED_ENTRIES=true.
+    allow_stacked_entries: bool = False
+    # Warn (never reject) when a passive entry limit sits this far from LTP.
+    max_passive_offset: float = 5.0
+    # Bound CLOSED trackers so long-running sessions do not grow without limit.
+    # Open/ERRORED legs and CLOSED legs with live/cancel-pending orders are never
+    # pruned. CLOSED_TRACKERS_MAX=0 disables only the count cap (age still applies).
+    closed_retention_sec: float = 86400.0
+    closed_trackers_max: int = 500
+
     @field_validator("sl_missing_confirmations", "flat_position_confirmations",
                      "entry_cancel_max_attempts",
                      "closed_sl_cancel_max_attempts",
@@ -155,6 +173,27 @@ class Settings(BaseSettings):
             raise ValueError("ORDER_TAG_REGISTRY_MAX must be >= 1")
         return int(v)
 
+    @field_validator("watch_min_interval_ms", "closed_trackers_max")
+    @classmethod
+    def _non_negative_counts(cls, v: int) -> int:
+        if int(v) < 0:
+            raise ValueError("count/interval values must be >= 0")
+        return int(v)
+
+    @field_validator("max_passive_offset")
+    @classmethod
+    def _non_negative_offset(cls, v: float) -> float:
+        if float(v) < 0:
+            raise ValueError("MAX_PASSIVE_OFFSET must be >= 0")
+        return float(v)
+
+    @field_validator("closed_retention_sec")
+    @classmethod
+    def _positive_closed_retention(cls, v: float) -> float:
+        if float(v) <= 0:
+            raise ValueError("CLOSED_RETENTION_SEC must be > 0")
+        return float(v)
+
     @field_validator("order_tag_prefix")
     @classmethod
     def _safe_tag_prefix(cls, v: str) -> str:
@@ -168,7 +207,7 @@ class Settings(BaseSettings):
                      "exit_confirm_poll_sec", "sl_visibility_grace_sec",
                      "reconcile_sec", "entry_cancel_retry_sec",
                      "sl_modify_timeout_sec", "sl_cancel_timeout_sec",
-                     "orderbook_timeout_sec")
+                     "orderbook_timeout_sec", "watch_session_ttl_sec")
     @classmethod
     def _positive_timing(cls, v: float) -> float:
         # A zero/negative timer would make the guarantees fire instantly or

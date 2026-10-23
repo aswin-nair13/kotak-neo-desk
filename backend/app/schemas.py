@@ -73,6 +73,13 @@ class WatchLeg(BaseModel):
 
 class WatchBody(BaseModel):
     legs: list[WatchLeg] = []
+    # Per-browser-session subscription owner. Optional so older clients keep
+    # working (they share the "default" session).
+    session_id: str | None = Field(default=None, max_length=64)
+
+
+class UnwatchBody(BaseModel):
+    session_id: str | None = Field(default=None, max_length=64)
 
 
 class ExitBody(BaseModel):

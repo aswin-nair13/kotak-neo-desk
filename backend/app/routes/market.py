@@ -7,7 +7,7 @@ from ..auth import require_user
 from ..broker_worker import WorkerQueueFull
 from ..config import settings
 from ..kotak_client import BrokerDataError, KotakService, sanitize_error_text
-from ..schemas import WatchBody
+from ..schemas import UnwatchBody, WatchBody
 
 router = APIRouter()
 kotak: KotakService | None = None
@@ -144,20 +144,63 @@ def quote(instrument: str = "NIFTY", expiry: str = "", strike: str = "",
 @router.post("/watch", dependencies=[Depends(require_user)])
 def watch(body: WatchBody):
     """Subscribe the server websocket to watchlist legs so their LTPs stream
-    over /ws (ticks carry both token `tk` and symbol `ts`). Returns token map."""
+    over /ws (ticks carry both token `tk` and symbol `ts`). Returns token map.
+
+    Plan 06 WP9: duplicate legs in one request are collapsed, and the bridge
+    coalesces the whole set into one subscribe round. Repeated identical
+    requests are deduped, and rapid changes are rate-limited per session.
+    """
     assert kotak is not None
     tokens: dict[str, str | None] = {}
+    keys: set[tuple[str, str]] = set()
+    seen: set[tuple[str, str, str, str]] = set()
     for leg in body.legs:
+        ident = (leg.instrument, leg.expiry, str(leg.strike), leg.option_type)
+        if ident in seen:
+            continue
+        seen.add(ident)
         symbol = f"{leg.instrument}{leg.expiry}{leg.strike}{leg.option_type}"
         exchange = "bse_fo" if leg.instrument == "SENSEX" else "nse_fo"
         tok = kotak.token_for(symbol, exchange)
         tokens[symbol] = tok
-        try:
-            if bridge is not None and tok:
-                bridge.ensure_option(exchange, tok)
-        except Exception:
-            pass
-    return {"tokens": tokens}
+        if tok:
+            keys.add((exchange, str(tok)))
+    sub = {}
+    if bridge is not None:
+        watch_options = getattr(bridge, "watch_options", None)
+        if callable(watch_options):
+            try:
+                sub = watch_options(keys, body.session_id) or {}
+            except Exception as e:  # noqa: BLE001 - watch must never 500 the UI
+                sub = {"error": sanitize_error_text(e)}
+        else:  # older bridge doubles
+            try:
+                for exchange, tok in keys:
+                    bridge.ensure_option(exchange, tok)
+            except Exception as e:  # noqa: BLE001
+                sub = {"error": sanitize_error_text(e)}
+    return {"tokens": tokens, "legs": len(seen), "subscribed": len(keys), **sub}
+
+
+@router.post("/unwatch", dependencies=[Depends(require_user)])
+def unwatch(body: UnwatchBody | None = None):
+    """Release one browser session's watchlist subscriptions (Plan 06 WP9).
+
+    Ref-counted: a token stays subscribed while a live tracker or another
+    session still needs it. Safe to call repeatedly (idempotent).
+    """
+    session = (body.session_id if body else None)
+    out = {"ok": True, "session_id": (session or "").strip() or "default",
+           "removed": False, "released_options": 0}
+    if bridge is not None:
+        fn = getattr(bridge, "unwatch", None)
+        if callable(fn):
+            try:
+                out.update(fn(session) or {})
+            except Exception as e:  # noqa: BLE001 - cleanup is best effort
+                out["error"] = sanitize_error_text(e)
+    out["ok"] = "error" not in out
+    return out
 
 
 @router.post("/batch-quotes", dependencies=[Depends(require_user)])

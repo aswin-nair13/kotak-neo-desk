@@ -129,7 +129,7 @@ def _version_fields(src) -> dict:
 
 
 class OrderFeedStale(RuntimeError):
-    """The SDK reported a dead/disconnected order feed — force a new session."""
+    """The SDK reported a dead/disconnected order feed - force a new session."""
 
 
 # ---------- pure mappers (dispatch on type name so tests need no SDK) ----------
@@ -289,6 +289,21 @@ class SFeedBridge:
         self._lock = threading.Lock()
         self._wanted: set[tuple[str, str]] = set()  # (exchange, token) option legs
         self._subscribed: set[tuple[str, str]] = set()  # wanted legs already on the live ws
+        # Plan 06 WP9: watchlist subscriptions are ref-counted per browser
+        # session and merged with the tokens tracked legs need. `_explicit_wanted`
+        # holds legs requested via ensure_option (placed orders); it is pruned
+        # once no live tracker/watch session needs the token.
+        self._explicit_wanted: set[tuple[str, str]] = set()
+        self._watch_sessions: dict[str, set[tuple[str, str]]] = {}
+        self._watch_last_ms: dict[str, int] = {}
+        self._watch_timers: dict[str, threading.Timer] = {}
+        # One subscribe/unsubscribe sync coroutine at a time. `_sub_dirty` means
+        # the desired set changed while that coroutine was awaiting the SDK, so
+        # it must diff again instead of dropping the final add/remove.
+        self._sub_running = False
+        self._sub_dirty = False
+        self._sub_retry_base_sec = 0.5
+        self._sub_retry_max_sec = 30.0
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         self._scheduler_thread: threading.Thread | None = None
@@ -310,6 +325,8 @@ class SFeedBridge:
         self._order_connected = False
         self._watchdog_reconnects = 0
         self._quiet_warned = False
+        self._feed_stale_since_ms: int | None = None
+        self._feed_stale_logged = False
         self._reconcile_state_lock = threading.Lock()
         self._reconcile_queued = 0
         self._reconcile_pending_force = False
@@ -353,6 +370,8 @@ class SFeedBridge:
         self._order_connected = False
         self._watchdog_reconnects = 0
         self._quiet_warned = False
+        self._feed_stale_since_ms = None
+        self._feed_stale_logged = False
         self.worker.start()
         self._scheduler_thread = threading.Thread(
             target=self._scheduler_loop, name="reconcile-sched", daemon=True)
@@ -371,6 +390,18 @@ class SFeedBridge:
         if timer:
             timer.cancel()
         with self._lock:
+            timers = list(self._watch_timers.values())
+            self._watch_timers.clear()
+            # A stopped bridge has no broker session; do not let stale browser
+            # sessions survive a Kotak logout/re-login. The frontend re-sends its
+            # current watch set (same per-tab session id) when it reconnects.
+            self._watch_sessions.clear()
+            self._watch_last_ms.clear()
+            self._sub_running = False
+            self._sub_dirty = False
+        for t in timers:
+            t.cancel()
+        with self._lock:
             self._subscribed.clear()  # next session resubscribes the full set
         sched, self._scheduler_thread = self._scheduler_thread, None
         if sched and sched.is_alive() and sched is not threading.current_thread():
@@ -387,6 +418,10 @@ class SFeedBridge:
     # ---------- periodic reconcile ----------
     def _scheduler_loop(self):
         while not self._stop.wait(self.reconcile_sec):
+            try:
+                self.prune_wanted()
+            except Exception as e:  # noqa: BLE001 - scheduler must survive one bad tick
+                log.error("wanted prune failed: %s", sanitize_error_text(e))
             try:
                 self._schedule_reconcile("periodic")
             except Exception as e:  # noqa: BLE001 - scheduler must survive one bad tick
@@ -547,11 +582,15 @@ class SFeedBridge:
         quiet = bool(self._started and self._order_connected
                      and (order_age is None or order_age >= threshold))
         stale = bool(self._started and not self._order_connected)
+        stale_alert = self._feed_stale_since_ms is not None
         return {
             "started": self._started,
             "order_connected": self._order_connected,
             "stale": stale,
             "quiet": quiet,
+            "feed_stale": bool(stale_alert or quiet or stale),
+            "feed_stale_since_ms": self._feed_stale_since_ms,
+            "feed_stale_age_ms": age(self._feed_stale_since_ms),
             "order_age_ms": order_age,
             "tick_age_ms": age(self._last_tick_ms),
             "last_order_msg_ms": self._last_order_msg_ms,
@@ -574,24 +613,309 @@ class SFeedBridge:
             "last_book_age_ms": age(self._last_book_ms),
             "last_book_ok": self._last_book_ok,
             "watchdog_reconnects": self._watchdog_reconnects,
+            "wanted_options": len(self._wanted),
+            "watch_sessions": len(self._watch_sessions),
             "worker": self.worker.status(),
         }
 
+    # ---------- option subscriptions (Plan 06 WP9) ----------
+    @staticmethod
+    def _key(exchange: str, token) -> tuple[str, str]:
+        return (str(exchange), str(token))
+
+    def _engine_keys_locked(self) -> tuple[set[tuple[str, str]], bool]:
+        """Tokens a live tracker still needs (CLOSED legs need no ticks).
+
+        Returns ``(keys, ok)``. On an engine read failure the caller must not
+        replace `_wanted` with this empty set: that would unsubscribe live
+        trackers and could leave a position without market data.
+        """
+        keys: set[tuple[str, str]] = set()
+        try:
+            legs = self.engine.all()
+        except Exception as e:  # noqa: BLE001 - health/read path must survive
+            log.error("engine tracker read failed; keeping subscriptions: %s",
+                      sanitize_error_text(e))
+            return keys, False
+        for o in legs:
+            token = o.get("instrument_token")
+            if token and o.get("status") != "CLOSED":
+                keys.add(self._key(o.get("exchange_segment") or "", token))
+        return keys, True
+
+    def _recompute_wanted_locked(self, engine_keys=None) -> tuple[set[tuple[str, str]], bool]:
+        if engine_keys is None:
+            engine_keys, ok = self._engine_keys_locked()
+        else:
+            ok = True
+        watch_keys: set[tuple[str, str]] = set()
+        for keys in self._watch_sessions.values():
+            watch_keys.update(keys)
+        if not ok:
+            # Conservative merge: add new watch/explicit tokens but never drop
+            # anything, because we cannot tell which tracker tokens are live.
+            self._wanted.update(self._explicit_wanted)
+            self._wanted.update(watch_keys)
+            return set(), False
+        desired = set(self._explicit_wanted)
+        desired.update(watch_keys)
+        desired.update(engine_keys)
+        removed = self._wanted - desired
+        self._wanted = desired
+        return removed, True
+
+    def _prune_watch_sessions_locked(self, now_ms: int | None = None):
+        """Drop sessions that stopped heartbeating; caller holds the lock."""
+        now = _now_ms() if now_ms is None else int(now_ms)
+        ttl_ms = max(0, int(float(settings.watch_session_ttl_sec) * 1000))
+        if not ttl_ms:
+            return [], []
+        stale = []
+        for session, last in list(self._watch_last_ms.items()):
+            if session not in self._watch_sessions:
+                self._watch_last_ms.pop(session, None)
+                continue
+            try:
+                age_ms = now - int(last)
+            except (TypeError, ValueError):
+                age_ms = ttl_ms
+            if age_ms >= ttl_ms:
+                stale.append(session)
+        timers = []
+        for session in stale:
+            self._watch_sessions.pop(session, None)
+            self._watch_last_ms.pop(session, None)
+            timer = self._watch_timers.pop(session, None)
+            if timer is not None:
+                timers.append(timer)
+        return stale, timers
+
+    def _prune_sessions(self) -> tuple[int, int]:
+        """Expire idle sessions and release their tokens. Returns (sessions, keys)."""
+        with self._lock:
+            stale, timers = self._prune_watch_sessions_locked()
+            removed, _ok = self._recompute_wanted_locked()
+        for t in timers:
+            t.cancel()
+        if removed:
+            self._ensure_subscribed()
+        return len(stale), len(removed)
+
+    def ensure_options(self, keys):
+        """Coalesce multiple placed-leg tokens into ONE subscribe round."""
+        added = False
+        with self._lock:
+            for exchange, token in keys:
+                if not token:
+                    continue
+                key = self._key(exchange, token)
+                self._explicit_wanted.add(key)
+                if key not in self._wanted:
+                    self._wanted.add(key)
+                    added = True
+        if added:
+            self._ensure_subscribed()
+
     def ensure_option(self, exchange: str, token: str | None):
-        """Subscribe one more option leg (called when a tracked order is placed,
-        or when the UI watchlist changes). Already-streaming tokens are skipped —
-        without this every watchlist edit re-sent the whole set per leg."""
+        """Subscribe one option leg (kept for existing callers)."""
         if not token:
             return
-        key = (exchange, str(token))
+        self.ensure_options({(exchange, token)})
+
+    def watch_options(self, keys, session_id: str | None = None,
+                      min_interval_ms: int | None = None) -> dict:
+        """Register a watchlist session's wanted tokens (Plan 06 WP9).
+
+        The request REPLACES that session's set, so removing a leg drops its
+        subscription unless a live tracker or another session still needs it.
+        Identical requests refresh the session timestamp without scheduling a
+        redundant subscribe; rapid changes are coalesced behind one timer.
+        """
+        session = str(session_id or "").strip() or "default"
+        requested = {self._key(ex, tk) for ex, tk in keys if tk}
+        now = _now_ms()
+        interval = max(0, int(settings.watch_min_interval_ms
+                            if min_interval_ms is None else min_interval_ms))
         with self._lock:
-            self._wanted.add(key)
-            if key in self._subscribed:
+            previous = self._watch_sessions.get(session)
+            same = previous == requested
+            last = self._watch_last_ms.get(session)
+            self._watch_sessions[session] = requested
+            self._watch_last_ms[session] = now
+            self._recompute_wanted_locked()
+            if same:
+                wait = 0
+                deduped = True
+            else:
+                deduped = False
+                wait = 0 if last is None else interval - (now - last)
+                if wait > 0 and session not in self._watch_timers:
+                    # One trailing timer per session. Further edits update the
+                    # recorded set; the timer applies the latest state once.
+                    t = threading.Timer(wait / 1000.0, self._flush_watch,
+                                        args=(session,))
+                    t.daemon = True
+                    self._watch_timers[session] = t
+                    t.start()
+        if not deduped and wait <= 0:
+            self._ensure_subscribed()
+        if wait > 0:
+            return {"session_id": session, "deduped": deduped,
+                    "throttled": True, "subscribe_in_ms": max(0, int(wait)),
+                    "wanted": len(requested), "wanted_options": len(self._wanted)}
+        return {"session_id": session, "deduped": deduped, "throttled": False,
+                "wanted": len(requested), "wanted_options": len(self._wanted)}
+
+    def _flush_watch(self, session_id: str):
+        """Timer body: apply the coalesced watch set once the cooldown expires."""
+        with self._lock:
+            self._watch_timers.pop(session_id, None)
+            if session_id not in self._watch_sessions:
                 return
+            self._watch_last_ms[session_id] = _now_ms()
+        self._ensure_subscribed()
+
+    def unwatch(self, session_id: str | None = None) -> dict:
+        """Drop a session's watch refs; tokens still needed stay subscribed."""
+        session = str(session_id or "").strip() or "default"
+        with self._lock:
+            existed = self._watch_sessions.pop(session, None) is not None
+            timer = self._watch_timers.pop(session, None)
+            self._watch_last_ms.pop(session, None)
+            removed, _ok = self._recompute_wanted_locked() if existed else (set(), True)
+            remaining = len(self._watch_sessions)
+        if timer is not None:
+            timer.cancel()
+        if removed:
+            self._ensure_subscribed()
+        return {"session_id": session, "removed": existed,
+                "released_options": len(removed), "watch_sessions": remaining}
+
+    def prune_wanted(self) -> int:
+        """Expire idle sessions and drop tokens nothing needs (Plan 06 WP9)."""
+        with self._lock:
+            _stale, timers = self._prune_watch_sessions_locked()
+            engine_keys, ok = self._engine_keys_locked()
+            if not ok:
+                # Never replace `_wanted` with a failed read's empty set. Keep
+                # existing tokens and still add any new watch/explicit refs.
+                watch_keys = set()
+                for keys in self._watch_sessions.values():
+                    watch_keys.update(keys)
+                self._wanted.update(self._explicit_wanted)
+                self._wanted.update(watch_keys)
+                removed = set()
+            else:
+                kept_explicit = {
+                    k for k in self._explicit_wanted
+                    if k in engine_keys
+                    or any(k in s for s in self._watch_sessions.values())}
+                self._explicit_wanted = kept_explicit
+                removed, _ok = self._recompute_wanted_locked(engine_keys=engine_keys)
+        for t in timers:
+            t.cancel()
+        if removed:
+            self._ensure_subscribed()
+        return len(removed)
+
+    def _ensure_subscribed(self):
+        """Wake the single subscription sync coroutine (dirty/epoch coalescing)."""
+        with self._lock:
             loop, ws = self._loop, self._ws
-        if loop and ws and not self._stop.is_set():
-            fut = asyncio.run_coroutine_threadsafe(self._subscribe_wanted(ws), loop)
-            fut.add_done_callback(lambda f: f.exception() and log.error("sub err: %s", f.exception()))
+            if not loop or not ws or self._stop.is_set():
+                return
+            self._sub_dirty = True
+            if self._sub_running:
+                return
+            self._sub_running = True
+        try:
+            fut = asyncio.run_coroutine_threadsafe(
+                self._sync_subscriptions(ws), loop)
+        except Exception as e:  # noqa: BLE001 - loop may be closing on stop
+            with self._lock:
+                self._sub_running = False
+            log.error("subscribe schedule failed: %s", sanitize_error_text(e))
+            return
+
+        def _done(f):
+            try:
+                exc = f.exception()
+            except Exception as e:  # noqa: BLE001 - cancelled future
+                exc = e
+            if exc:
+                log.error("subscription sync err: %s", exc)
+                with self._lock:
+                    if self._ws is ws:
+                        self._sub_running = False
+                self._ensure_subscribed()
+
+        fut.add_done_callback(_done)
+
+    async def _sync_subscriptions(self, ws, extra=()):
+        """Converge broker subscriptions on the full desired set.
+
+        Runs one SDK call at a time, resubscribes anything added while a call
+        was in flight, unsubscribes anything removed, and retries failures with
+        capped backoff. Caller set `_sub_running`; this method clears it.
+        """
+        from neo_api_client.websocket.feed import WsToken
+        pending_extra = [self._key(ex, tk) for ex, tk in extra if tk]
+        delay = max(0.001, float(self._sub_retry_base_sec))
+        while True:
+            with self._lock:
+                if self._stop.is_set() or self._ws is not ws:
+                    if self._ws is ws:
+                        self._sub_running = False
+                    return
+                wanted = set(self._wanted)
+                subscribed = set(self._subscribed)
+                adds = sorted(wanted - subscribed)
+                removes = sorted(subscribed - wanted)
+                if not adds and not removes and not pending_extra:
+                    if self._sub_dirty:
+                        self._sub_dirty = False
+                        continue
+                    self._sub_running = False
+                    return
+                self._sub_dirty = False
+            ok = True
+            if removes:
+                try:
+                    await self._unsubscribe_keys(ws, removes)
+                except Exception as e:  # noqa: BLE001 - retried with backoff
+                    ok = False
+                    log.error("unsubscribe failed: %s", sanitize_error_text(e))
+                else:
+                    with self._lock:
+                        if self._ws is ws:
+                            self._subscribed.difference_update(removes)
+            add_keys = list(adds) + pending_extra
+            if add_keys:
+                try:
+                    await ws.subscribe_scrips(
+                        [WsToken(ex, tk) for ex, tk in add_keys])
+                except Exception as e:  # noqa: BLE001 - retried with backoff
+                    ok = False
+                    log.error("subscribe failed: %s", sanitize_error_text(e))
+                else:
+                    with self._lock:
+                        if self._ws is ws:
+                            self._subscribed.update(adds)
+                    pending_extra = []
+            if ok:
+                delay = max(0.001, float(self._sub_retry_base_sec))
+            else:
+                await asyncio.sleep(delay)
+                delay = min(float(self._sub_retry_max_sec), delay * 2.0)
+
+    async def _unsubscribe_keys(self, ws, keys):
+        fn = getattr(ws, "unsubscribe_scrips", None)
+        if not callable(fn):
+            log.warning("SDK has no unsubscribe_scrips; local state will drop %d "
+                        "token(s) but the broker stream may continue", len(keys))
+            return
+        from neo_api_client.websocket.feed import WsToken
+        await fn([WsToken(ex, tk) for ex, tk in keys])
 
     # ---------- thread body ----------
     def _run(self):
@@ -664,7 +988,15 @@ class SFeedBridge:
             self._ws = ws
             with self._lock:
                 self._subscribed.clear()  # a fresh socket forgot every sub
-            await self._subscribe_wanted(ws, extra=base)
+                self._sub_running = True
+                self._sub_dirty = False
+            try:
+                await self._sync_subscriptions(ws, extra=base)
+            except BaseException:
+                with self._lock:
+                    if self._ws is ws:
+                        self._sub_running = False
+                raise
             try:
                 async for msg in ws:
                     tick = map_feed_message(msg)
@@ -693,7 +1025,8 @@ class SFeedBridge:
             self._last_order_ok_ms = self._last_order_msg_ms
             self._last_order_liveness_ms = self._last_order_msg_ms
             self._quiet_warned = False
-            log.info("order feed connected — scheduling reconcile")
+            self._note_feed_alive()
+            log.info("order feed connected - scheduling reconcile")
             self._schedule_reconcile("connect", force=True)
             reader = asyncio.create_task(self._read_order_feed(feed),
                                          name="sfeed-order-reader")
@@ -715,6 +1048,23 @@ class SFeedBridge:
                 reader.cancel()
                 await asyncio.gather(reader, return_exceptions=True)
 
+    def _note_feed_stale(self, reason: str, age_ms: int):
+        """Log one alert per stale episode (Plan 06 WP10), not once per tick."""
+        if self._feed_stale_since_ms is None:
+            self._feed_stale_since_ms = _now_ms()
+        if self._feed_stale_logged:
+            return
+        self._feed_stale_logged = True
+        log.warning("FEED STALE: order feed %s for %dms (threshold %dms) - "
+                    "supervisor owns reconnect (SDK auto-reconnect is disabled)",
+                    reason, max(0, int(age_ms)), int(self.feed_stale_sec * 1000))
+
+    def _note_feed_alive(self):
+        if self._feed_stale_logged or self._feed_stale_since_ms is not None:
+            log.info("FEED RECOVERED: order feed is producing updates again")
+        self._feed_stale_since_ms = None
+        self._feed_stale_logged = False
+
     def _watchdog_tick(self, feed) -> bool:
         """True only when the feed is genuinely dead (force a reconnect).
 
@@ -728,8 +1078,11 @@ class SFeedBridge:
             connected = None
         last_msg = self._last_order_msg_ms
         if connected is False:
+            msg_age = now - (last_msg if last_msg is not None else now)
+            self._note_feed_stale("disconnected", msg_age)
             self._watchdog_reconnects += 1
-            log.error("order feed reports disconnected — forcing reconnect")
+            log.error("order feed reports disconnected - closing the session so "
+                      "the supervisor reconnects (SDK auto-reconnect disabled)")
             return True
         if connected is True:
             self._last_order_liveness_ms = now
@@ -741,14 +1094,17 @@ class SFeedBridge:
                                 "(threshold %dms); not reconnecting",
                                 msg_age, int(self.feed_stale_sec * 1000))
                     self._quiet_warned = True
+                self._note_feed_stale("quiet", msg_age)
             else:
                 self._quiet_warned = False
+                self._note_feed_alive()
             return False
         idle = now - (last_msg if last_msg is not None else now)
         if idle >= self.feed_idle_reconnect_sec * 1000:
+            self._note_feed_stale("idle", idle)
             self._watchdog_reconnects += 1
             log.error("order feed idle for %dms with no connection signal "
-                      "(threshold %dms) — forcing reconnect",
+                      "(threshold %dms) - forcing reconnect",
                       idle, int(self.feed_idle_reconnect_sec * 1000))
             return True
         if idle >= self.feed_stale_sec * 1000 and not self._quiet_warned:
@@ -756,12 +1112,15 @@ class SFeedBridge:
                         "signal, waiting up to %ss before reconnecting",
                         idle, self.feed_idle_reconnect_sec)
             self._quiet_warned = True
+        if idle >= self.feed_stale_sec * 1000:
+            self._note_feed_stale("quiet (no liveness signal)", idle)
         return False
 
     async def _read_order_feed(self, feed):
         async for msg in feed:
             self._last_order_msg_ms = _now_ms()
             self._quiet_warned = False
+            self._note_feed_alive()
             self._handle_orderfeed_message(msg)
 
     def fetch_book(self):
@@ -807,21 +1166,6 @@ class SFeedBridge:
             # exposed text to the exception type (no SDK/session details).
             self._last_positions_error = type(e).__name__
         return book, positions, book_ok
-
-    async def _subscribe_wanted(self, ws, extra=None):
-        from neo_api_client.websocket.feed import WsToken
-        with self._lock:
-            wanted = sorted(self._wanted)
-            toks = [WsToken(ex, tk) for ex, tk in wanted] + list(extra or [])
-        if not toks:
-            return
-        try:
-            await ws.subscribe_scrips(toks)
-            with self._lock:
-                self._subscribed.update(wanted)
-            log.info("subscribed %d scrips", len(toks))
-        except Exception as e:
-            log.error("subscribe failed: %s", sanitize_error_text(e))
 
     def _apply_tick(self, tick: dict):
         try:

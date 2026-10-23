@@ -69,6 +69,22 @@ const newTag = () => {
   return `t${raw.replace(/[^a-z0-9]/gi, '').slice(0, 15)}`
 }
 
+// One watch session per browser tab. Keeping it in sessionStorage means a
+// remount/refresh reuses the same server-side ref instead of leaking a new one;
+// the backend expires it if the tab disappears without a clean unwatch.
+const getSessionId = () => {
+  const key = 'sfeed-watch-session'
+  try {
+    const cur = sessionStorage.getItem(key)
+    if (cur) return cur
+    const next = (crypto.randomUUID && crypto.randomUUID()) || `s${Date.now()}`
+    sessionStorage.setItem(key, next)
+    return next
+  } catch {
+    return (crypto.randomUUID && crypto.randomUUID()) || `s${Date.now()}`
+  }
+}
+
 // click-to-fill latency formatting (client-measured wall clock)
 const fmtLat = (ms) => {
   if (ms == null || !Number.isFinite(ms) || ms < 0) return null
@@ -87,6 +103,7 @@ export default function App() {
   const [kotakBusy, setKotakBusy] = useState(false)
   const [egressIp, setEgressIp] = useState(null)
   const [health, setHealth] = useState(null)
+  const [feedEpoch, setFeedEpoch] = useState(0)
   const [ticks, setTicks] = useState({})
   const [orders, setOrders] = useState([])
   const [synthetic, setSynthetic] = useState([])
@@ -156,6 +173,11 @@ export default function App() {
 
   const auth = { headers: { Authorization: `Bearer ${token}` } }
   const say = (kind, text) => setMsg({ kind, text })
+  // Server-side placement warnings (WP11 passive-limit guard); shown but never
+  // treated as a failure — the order is live.
+  const warnText = (warnings) => (
+    warnings && warnings.length ? ` Warning: ${warnings.join('; ')}` : ''
+  )
 
   const applyPositions = (r) => {
     setPositions(r.data.positions || {})
@@ -190,18 +212,34 @@ export default function App() {
   /* live socket — index ticks by token AND by symbol (ts) so option legs resolve */
   useEffect(() => {
     if (!token) return
-    const ws = new WebSocket(wsUrl())
-    // First frame authenticates the feed; the server sends nothing before it.
-    ws.onopen = () => ws.send(JSON.stringify({ token }))
-    ws.onclose = (e) => {
-      // 1008 = auth/origin policy rejection -> drop the stale token, re-login.
-      if (e.code === 1008) {
-        localStorage.removeItem('token')
-        setToken('')
-        setKotakIn(false)
+    let stopped = false
+    let retry = null
+    let ws = null
+    const connect = () => {
+      if (stopped) return
+      ws = new WebSocket(wsUrl())
+      // First frame authenticates the feed; the server sends nothing before it.
+      ws.onopen = () => {
+        if (stopped) {
+          ws.close()
+          return
+        }
+        ws.send(JSON.stringify({ token }))
+        // A fresh backend has no watch refs; let the watch effect re-register
+        // this tab immediately instead of waiting for the TTL/heartbeat.
+        setFeedEpoch((n) => n + 1)
       }
-    }
-    ws.onmessage = (e) => {
+      ws.onclose = (e) => {
+        // 1008 = auth/origin policy rejection -> drop the stale token, re-login.
+        if (e.code === 1008) {
+          localStorage.removeItem('token')
+          setToken('')
+          setKotakIn(false)
+          return
+        }
+        if (!stopped) retry = setTimeout(connect, 3000)
+      }
+      ws.onmessage = (e) => {
       try {
         const m = JSON.parse(e.data)
         if (m.kind === 'tick' && m.tick?.tk) {
@@ -246,8 +284,14 @@ export default function App() {
           }
         }
       } catch { /* ignore */ }
+      }
     }
-    return () => ws.close()
+    connect()
+    return () => {
+      stopped = true
+      if (retry) clearTimeout(retry)
+      if (ws) ws.close()
+    }
   }, [token])
 
   /* feed/reconcile freshness (Plan 06 WP2) — compact topbar indicator */
@@ -326,7 +370,11 @@ export default function App() {
       setLoginErr('Login failed — check username / password.')
     }
   }
-  const logout = () => { localStorage.removeItem('token'); setToken(''); setKotakIn(false) }
+  const logout = () => {
+    api.post('/market/unwatch', { session_id: sessionRef.current }, auth).catch(() => {})
+    watchSentRef.current = false
+    localStorage.removeItem('token'); setToken(''); setKotakIn(false)
+  }
 
   const kotakLogin = async () => {
     setKotakBusy(true)
@@ -446,10 +494,84 @@ export default function App() {
   }, [spot > 0, kotakIn, f.expiry])
 
   /* ---- watchlist websocket subscription + REST fallback quotes ---- */
-  // /watch is cheap (deduped server-side); /batch-quotes hits Kotak REST which
-  // rate-limits hard (429 + dropped connections), so REST is throttled: fresh
-  // fetch only when a leg lacks any price or the last fetch is >15s old.
-  // Live ticks on the websocket are the primary price source regardless.
+  // /watch is sent when the selection changes, on tab mount, on websocket
+  // reconnect, and as a heartbeat so the backend keeps this session's refs
+  // alive (Plan 06 WP9). The backend dedupes identical sets, so a heartbeat does
+  // not re-subscribe the watchlist.
+  // /batch-quotes hits Kotak REST which rate-limits hard (429 + dropped
+  // connections), so REST is throttled: fresh fetch only when a leg lacks any
+  // price or the last fetch is >15s old. Live ws ticks are the primary source.
+  const sessionRef = useRef(getSessionId())
+  const watchSentRef = useRef(false)
+  const watchSig = useMemo(() => {
+    if (!f.expiry || !legs.length) return ''
+    return legs
+      .map((l) => `${f.instrument}|${f.expiry}|${l.strike}|${l.otype}`)
+      .sort().join(',')
+  }, [JSON.stringify(legs), f.instrument, f.expiry]) // eslint-disable-line react-hooks/exhaustive-deps
+
+  useEffect(() => {
+    if (!kotakIn) {
+      if (watchSentRef.current) {
+        watchSentRef.current = false
+        api.post('/market/unwatch', { session_id: sessionRef.current }, auth)
+          .catch(() => {})
+      }
+      return
+    }
+    const send = () => {
+      if (!watchSig) {
+        watchSentRef.current = false
+        api.post('/market/unwatch', { session_id: sessionRef.current }, auth)
+          .catch(() => {})
+        return
+      }
+      const body = {
+        session_id: sessionRef.current,
+        legs: legs.map((l) => ({
+          instrument: f.instrument, expiry: f.expiry,
+          strike: String(l.strike), option_type: l.otype,
+        })),
+      }
+      watchSentRef.current = true
+      api.post('/market/watch', body, auth).catch(() => {})
+    }
+    send()
+    // Heartbeat refreshes the backend session TTL even when the selection has
+    // not changed (and re-registers it after a backend/broker reconnect).
+    const id = setInterval(send, 240000)
+    const onVisible = () => {
+      if (document.visibilityState === 'visible') send()
+    }
+    const onPageHide = () => {
+      if (!watchSentRef.current) return
+      watchSentRef.current = false
+      const t = localStorage.getItem('token')
+      fetch('/api/market/unwatch', {
+        method: 'POST',
+        keepalive: true,
+        headers: {
+          'Content-Type': 'application/json',
+          ...(t ? { Authorization: `Bearer ${t}` } : {}),
+        },
+        body: JSON.stringify({ session_id: sessionRef.current }),
+      }).catch(() => {})
+    }
+    const onPageShow = (e) => {
+      if (e.persisted) send()
+    }
+    document.addEventListener('visibilitychange', onVisible)
+    window.addEventListener('pagehide', onPageHide)
+    window.addEventListener('pageshow', onPageShow)
+    return () => {
+      clearInterval(id)
+      document.removeEventListener('visibilitychange', onVisible)
+      window.removeEventListener('pagehide', onPageHide)
+      window.removeEventListener('pageshow', onPageShow)
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [watchSig, kotakIn, token, feedEpoch])
+
   const lastBatchRef = useRef(0)
   useEffect(() => {
     if (!kotakIn || !f.expiry || !legs.length) return
@@ -459,7 +581,6 @@ export default function App() {
         strike: String(l.strike), option_type: l.otype,
       })),
     }
-    api.post('/market/watch', body, auth).catch(() => {})
     const missing = legs.some((l) => {
       const s = symOf(f.instrument, f.expiry, l.strike, l.otype)
       return (ticks[s]?.ltp ?? ticks[s]?.iv ?? px[s]) == null
@@ -545,7 +666,8 @@ export default function App() {
         for (const l of r.data.legs || []) { rememberClick(l.entry_order_id, tClick, l.timing, l.symbol); ids.push(l.entry_order_id) }
         notePending(lockName, ids)
         const b0 = r.data.legs?.[0]?.timing?.broker_rtt_ms
-        say('ok', `${label} straddle placed: ${(r.data.legs || []).map((l) => l.symbol).join(' + ')} (api ${fmtLat(apiMs)}${b0 != null ? `, broker ${fmtLat(b0)}` : ''} — fill time lands in the feed below)`)
+        const straddleWarnings = (r.data.legs || []).flatMap((l) => l.warnings || [])
+        say('ok', `${label} straddle placed: ${(r.data.legs || []).map((l) => l.symbol).join(' + ')} (api ${fmtLat(apiMs)}${b0 != null ? `, broker ${fmtLat(b0)}` : ''} — fill time lands in the feed below)${warnText(straddleWarnings)}`)
       } else {
         const strike = otype === 'CE' ? f.ce_strike : f.pe_strike
         const sym = symOf(f.instrument, f.expiry, strike, otype)
@@ -569,7 +691,7 @@ export default function App() {
         rememberClick(r.data.entry_order_id, tClick, r.data.timing, r.data.symbol)
         notePending(lockName, [r.data.entry_order_id])
         const b = r.data.timing?.broker_rtt_ms
-        say('ok', `${label} ${r.data.symbol} @ ${r.data.entry} → TGT ${r.data.target} / SL ${r.data.stop} (api ${fmtLat(apiMs)}${b != null ? `, broker ${fmtLat(b)}` : ''} — fill time lands in the feed below)`)
+        say('ok', `${label} ${r.data.symbol} @ ${r.data.entry} → TGT ${r.data.target} / SL ${r.data.stop} (api ${fmtLat(apiMs)}${b != null ? `, broker ${fmtLat(b)}` : ''} — fill time lands in the feed below)${warnText(r.data.warnings)}`)
       }
       refreshData() // keep dropdowns + watchlist intact
     } catch (e) {
@@ -610,7 +732,7 @@ export default function App() {
       const apiMs = Date.now() - tClick
       rememberClick(r.data.entry_order_id, tClick, r.data.timing, r.data.symbol)
       const b = r.data.timing?.broker_rtt_ms
-      say('ok', `${side === 'S' ? 'Sell' : 'Buy'} ${r.data.symbol} @ ${r.data.entry} → TGT ${r.data.target} / SL ${r.data.stop} (api ${fmtLat(apiMs)}${b != null ? `, broker ${fmtLat(b)}` : ''})`)
+      say('ok', `${side === 'S' ? 'Sell' : 'Buy'} ${r.data.symbol} @ ${r.data.entry} → TGT ${r.data.target} / SL ${r.data.stop} (api ${fmtLat(apiMs)}${b != null ? `, broker ${fmtLat(b)}` : ''})${warnText(r.data.warnings)}`)
       refreshData()
     } catch (e) {
       say('err', `Order failed: ${e.response?.data?.detail || e.message}`)
@@ -758,6 +880,18 @@ export default function App() {
   })
 
   /* ---- render ---- */
+  const healthAlerts = []
+  if (health && kotakIn) {
+    if (health.feed?.stale || !health.feed?.order_connected) {
+      healthAlerts.push(`Order feed down${health.feed?.feed_stale_age_ms ? ` for ${fmtLat(health.feed.feed_stale_age_ms)}` : ''}`)
+    } else if (health.feed?.quiet) {
+      healthAlerts.push(`Order feed quiet ${fmtLat(health.feed_order_age_ms) ?? ''}`)
+    }
+    if (health.naked_legs > 0) healthAlerts.push(`${health.naked_legs} NAKED leg(s) — no protective SL`)
+    if (health.errored_legs > 0) healthAlerts.push(`${health.errored_legs} ERRORED leg(s) — manual action needed`)
+  }
+  if (posMeta.stale) healthAlerts.push('Positions unavailable — last good snapshot shown')
+
   if (!token) return (
     <div className="page">
       <div className="login-wrap">
@@ -809,6 +943,11 @@ export default function App() {
       </div>
 
       {msg && <p className={`msg ${msg.kind}`}>{msg.text}</p>}
+      {healthAlerts.length > 0 && (
+        <p className="msg err">
+          {healthAlerts.join(' · ')}
+        </p>
+      )}
 
       {!kotakIn && (
         <div className="card">

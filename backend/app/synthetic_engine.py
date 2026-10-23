@@ -54,6 +54,7 @@ class SyntheticEngine:
 
     # -- CRUD --
     def _add_locked(self, d: dict) -> dict:
+        self._prune_closed_locked()
         d = copy.deepcopy(d)
         # Plan 06 WP3: the SL guarantee clock starts when the entry is
         # accepted/registered, not when the feed eventually reports a fill.
@@ -394,6 +395,62 @@ class SyntheticEngine:
         with self._lock:
             return [copy.deepcopy(o) for o in self.orders.values()]
 
+    @staticmethod
+    def _closed_has_live_work(o: dict) -> bool:
+        """True when a CLOSED leg may still have a working/cancel-pending order."""
+        if o.get("exit_pending") or o.get("exit_state"):
+            return True
+        if o.get("late_exit_risk") or o.get("late_sl_risk"):
+            return True
+        if o.get("manual_sl_cancel_pending") or o.get("entry_cancel_pending"):
+            return True
+        if (int(o.get("closed_sl_cancel_attempts") or 0)
+                and not o.get("closed_sl_cancel_ok_ms")):
+            return True
+        exit_id = str(o.get("exit_order_id") or "")
+        return bool(exit_id and exit_id in (o.get("cancel_requested_ids") or {}))
+
+    def _prune_closed_locked(self, now_ms: int | None = None):
+        """Bound CLOSED trackers by age and count (Plan 06 WP11).
+
+        Open/ERRORED/blocked legs are never touched: they may still need
+        protection or operator action. A CLOSED leg whose exit/SL cancel is
+        still in flight (late-exit risk) is also retained, even past the cap,
+        so a live order can never be forgotten. Caller holds the lock.
+        """
+        now = int(time.time() * 1000) if now_ms is None else int(now_ms)
+        retention_ms = max(0.0, float(settings.closed_retention_sec)) * 1000
+        closed = [(eid, o) for eid, o in self.orders.items()
+                  if o.get("status") == "CLOSED"
+                  and not self._closed_has_live_work(o)]
+        if retention_ms:
+            for eid, o in closed:
+                ts = o.get("closed_at_ms")
+                if ts is None:
+                    continue
+                try:
+                    old = now - int(ts)
+                except (TypeError, ValueError):
+                    continue
+                if old >= retention_ms:
+                    self.orders.pop(eid, None)
+        cap = max(0, int(settings.closed_trackers_max))
+        if not cap:
+            return
+        closed = [(eid, o) for eid, o in self.orders.items()
+                  if o.get("status") == "CLOSED"
+                  and not self._closed_has_live_work(o)]
+        if len(closed) > cap:
+            closed.sort(key=lambda kv: int(kv[1].get("closed_at_ms") or 0))
+            for eid, _ in closed[:len(closed) - cap]:
+                self.orders.pop(eid, None)
+
+    def prune_closed(self) -> int:
+        with self._lock:
+            before = len(self.orders)
+            self._prune_closed_locked()
+            return before - len(self.orders)
+
     def _legs_for_symbol_locked(self, symbol: str) -> list[dict]:
         return [o for o in self.orders.values()
                 if o.get("trading_symbol") == symbol
@@ -409,8 +466,10 @@ class SyntheticEngine:
         entry/SL exchange orders need cancelling by the caller."""
         with self._lock:
             out = self._legs_for_symbol_locked(symbol)
+            now = int(time.time() * 1000)
             for o in out:
                 o["status"] = "CLOSED"
+                o["closed_at_ms"] = now
                 o["exit_reason"] = reason
                 self._clear_pending_on_close(o)
             return [copy.deepcopy(o) for o in out]
@@ -972,6 +1031,7 @@ class SyntheticEngine:
                           syn["trading_symbol"], oid, int(filled))
                 return ("place_sl", syn, od)
             syn["status"] = "CLOSED"
+            syn["closed_at_ms"] = t_now
             syn["exit_reason"] = "ENTRY_" + status.upper()
             self._clear_pending_on_close(syn)
 
@@ -1692,6 +1752,11 @@ class SyntheticEngine:
         if not ok:
             log.error("SL placement %s for %s: %s",
                       "ambiguous" if ambiguous else "rejected", sym, r)
+        else:
+            log.info("SL PLACED %s entry=%s sl=%s qty=%s stop=%s",
+                     sym, syn.get("entry_order_id"),
+                     (r or {}).get("nOrdNo") if isinstance(r, dict) else None,
+                     sl_qty, stop_price)
 
     # -- cancel/exit integrity (Plan 06 WP4, non-blocking state machine) --
     def _block_exit(self, syn: dict, reason: str, error: str, naked: bool):
@@ -2176,6 +2241,7 @@ class SyntheticEngine:
         # Snapshot actual trackers under the lock, then drive them outside it:
         # reconcile may place an SL (broker I/O) and must not block health reads.
         with self._lock:
+            self._prune_closed_locked()
             legs = list(self.orders.values())
         return self._reconcile(legs, book, positions, positions_ok)
 

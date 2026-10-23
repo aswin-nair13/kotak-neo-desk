@@ -183,6 +183,7 @@ def test_entry_cancel_closes_without_sl(pending):
     eng.on_order_update({"nOrdNo": "E1", "ordSt": "cancelled"})
     assert eng.orders["E1"]["status"] == "CLOSED"
     assert eng.orders["E1"]["exit_reason"] == "ENTRY_CANCELLED"
+    assert eng.orders["E1"]["closed_at_ms"]
     assert broker.place_stop_loss.call_count == 0
 
 
@@ -211,6 +212,8 @@ def test_single_order_idempotent_replay(monkeypatch):
 
 
 def test_distinct_tags_place_distinct_orders(monkeypatch):
+    # Stacked entries are opt-in (WP11); this test is about tag idempotency.
+    monkeypatch.setattr(orders_routes.settings, "allow_stacked_entries", True)
     broker = _wire(monkeypatch)
     b1 = SingleOrderBody(instrument="NIFTY", expiry="25N18", option_type="CE", strike="25000",
                          lots=1, entry_mode="MKT", side="B", client_order_tag="dup-a")

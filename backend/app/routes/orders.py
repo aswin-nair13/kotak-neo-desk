@@ -263,6 +263,59 @@ def _ms() -> int:
     return int(time.time() * 1000)
 
 
+def _stacked_leg(symbol: str):
+    """An existing open/working tracker on this exact contract (WP11).
+
+    An ERRORED tracker with no live/ambiguous order state (for example an entry
+    that was rejected before any fill) must not block a fresh entry forever.
+    Anything that may still have an exchange order stays blocking.
+    """
+    if engine is None:
+        return None
+    try:
+        legs = engine.legs_for_symbol(symbol)
+    except Exception:  # noqa: BLE001 - never block on a read failure
+        return None
+    for leg in legs:
+        if leg.get("status") != "ERRORED":
+            return leg
+        if any(leg.get(k) for k in (
+                "naked_position", "exit_pending", "exit_ambiguous",
+                "sl_ambiguous", "sl_order_id", "exit_order_id")):
+            return leg
+    return None
+
+
+def _passive_warning(symbol: str, side: str, entry, ref_ltp) -> str | None:
+    """Warn when a passive limit is unusually far from LTP (WP11).
+
+    BUY below LTP and SELL above LTP are passive; a gap beyond
+    `MAX_PASSIVE_OFFSET` is legal but unlikely to fill, so it is surfaced on
+    the placement response (never rejected).
+    """
+    try:
+        ref = float(ref_ltp)
+        px = float(entry)
+    except (TypeError, ValueError):
+        return None
+    gap = (px - ref) if str(side).upper() == "S" else (ref - px)
+    limit = float(settings.max_passive_offset)
+    if gap <= limit:
+        return None
+    return (f"{symbol}: limit {px:.2f} is {gap:.2f} away from LTP {ref:.2f} "
+            f"(max passive offset {limit:g}); it may not fill")
+
+
+def _attach_warnings(result, symbol: str, side: str, entry, ref_ltp):
+    warning = _passive_warning(symbol, side, entry, ref_ltp)
+    if not warning or not isinstance(result, dict):
+        return result
+    log.warning("PASSIVE OFFSET %s", warning)
+    out = dict(result)
+    out["warnings"] = list(out.get("warnings") or []) + [warning]
+    return out
+
+
 def _safe_text(value, limit: int = 200) -> str:
     """One-line, credential-redacted broker text for API/log surfaces."""
     return sanitize_error_text(value, limit)
@@ -544,6 +597,22 @@ def _place_tracked(exchange, symbol, qty, entry, body_target, body_stop, strateg
     click-to-fill latency display."""
     assert kotak is not None and engine is not None
     side = "S" if str(side).upper() == "S" else "B"
+    # Plan 06 WP11: never stack a second bracket on one contract unless the
+    # operator explicitly enabled it. Checked on the worker so a concurrent
+    # double request cannot both pass a route-side check.
+    if not settings.allow_stacked_entries:
+        existing = _stacked_leg(symbol)
+        if existing is not None:
+            log.warning("STACKED ENTRY BLOCKED %s: existing leg %s status=%s",
+                        symbol, existing.get("entry_order_id"),
+                        existing.get("status"))
+            raise HTTPException(
+                status_code=409,
+                detail=(f"{symbol} already has an open bracket "
+                        f"({existing.get('status')}, entry "
+                        f"{existing.get('entry_order_id')}). Stacked entries are "
+                        "disabled (ALLOW_STACKED_ENTRIES=false); cancel/exit it "
+                        "first or enable stacked entries server-side."))
     t_recv_ms = t_recv_ms if t_recv_ms is not None else _ms()
     kw = dict(exchange_segment=exchange, quantity=qty, trading_symbol=symbol,
               transaction_type=side, product=product, order_type="L", price=entry)
@@ -720,6 +789,7 @@ def place_single(body: SingleOrderBody, ref_ltp: float = 0):
             body.strategy, body.trail_distance, body.product, body.side,
             t_recv, tag=tag, label=f"place_single:{sym}",
             timeout=_place_wait_sec())
+        result = _attach_warnings(result, sym, body.side, entry, ltp)
         _idem_store(tag, result)
         return result
 
@@ -740,11 +810,12 @@ def place_straddle(body: StraddleBody, ce_ltp: float = 0, pe_ltp: float = 0):
         for otype, strike, ltp in (("CE", body.ce_strike, ce_ltp), ("PE", body.pe_strike, pe_ltp)):
             ex, sym, qty, entry = _leg(body.instrument, body.expiry, otype, strike, body.lots,
                                        body.entry_mode, ltp, 0, body.side)
-            out.append(_run_on_worker(
+            leg_out = _run_on_worker(
                 _place_tracked, ex, sym, qty, entry, body.target_points, body.stop_points,
                 body.strategy, body.trail_distance, body.product,
                 body.side, t_recv, tag=tag, label=f"place_straddle:{sym}",
-                timeout=_place_wait_sec()))
+                timeout=_place_wait_sec())
+            out.append(_attach_warnings(leg_out, sym, body.side, entry, ltp))
         result = {"legs": out}
         _idem_store(tag, result)
         return result
