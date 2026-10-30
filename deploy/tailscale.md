@@ -20,7 +20,9 @@ beyond your tailnet.
    ```
 4. Browse `https://<machine>.<tailnet>.ts.net` from any tailnet device.
 5. Keep 80/443 closed publicly (already done by `ec2-setup.sh`); SSH via the
-   tailnet too once bootstrapped.
+   tailnet too once bootstrapped. If you keep a direct SSH bootstrap rule from a
+   dynamic home IP, run `deploy/ufw-refresh.sh <ddns-host>` from cron: it
+   rewrites only that SSH rule and never opens 80/443.
 6. Keep the app login + JWT — Tailscale is the network layer, not a substitute
    for auth.
 7. `IP_ALLOWLIST` can be your tailnet CIDR (`100.64.0.0/10`) or left tighter.

@@ -51,7 +51,7 @@ persistence — future separate storage session).
 - One group per branch/PR; keep the change reviewable.
 - No secret values in code, logs, commits, or these docs.
 - Run the existing suite before/after: `cd backend; uv run pytest tests/ -q`
-  (currently 25 passing). Add tests for each behavioral change.
+  (currently 243 passing). Add tests for each behavioral change.
 - Any change touching order placement (`orders.py`, `synthetic_engine.py`,
   `kotak_client.py`) must preserve the synthetic-bracket lifecycle invariants
   (see `04-order-execution-integrity.md`).

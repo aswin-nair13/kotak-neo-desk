@@ -13,7 +13,9 @@ set -euo pipefail
 ALLOW="${1:?Usage: ./ec2-setup.sh <YOUR_IP_OR_CIDR>  (e.g. 49.37.0.0/16)}"
 
 sudo apt-get update
-sudo apt-get install -y docker.io docker-compose-plugin ufw fail2ban dnsutils curl
+# Ubuntu 24.04 ships Docker Compose v2 as "docker-compose-v2"; the
+# "docker-compose-plugin" name only exists in Docker's own apt repository.
+sudo apt-get install -y docker.io docker-compose-v2 ufw fail2ban dnsutils curl
 sudo usermod -aG docker ubuntu
 
 # Public surface: SSH only (from your IP). 80/443 stay closed — TLS is via Tailscale.

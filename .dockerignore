@@ -1,0 +1,27 @@
+# Keep the build context to source only: host venvs, node_modules and build
+# output contain platform-specific binaries that would overwrite the Linux
+# dependencies installed inside the image.
+
+# VCS / local config
+.git
+.gitignore
+.env
+.env.*
+!.env.example
+
+# Python
+**/__pycache__/
+**/*.py[cod]
+backend/.venv/
+backend/.pytest_cache/
+backend/.ruff_cache/
+backend/logs/
+
+# Frontend
+frontend/node_modules/
+frontend/dist/
+
+# Local artifacts
+logs/
+*.zip
+out.zip

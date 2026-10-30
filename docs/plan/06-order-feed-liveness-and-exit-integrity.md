@@ -461,7 +461,7 @@ Reuse the existing fake-broker/fake-feed style in `backend/tests`:
   adopted.
 - Frontend: watch change → one debounced call; cancel/modify/SL confirm flow.
 
-Run: `cd backend; uv run pytest tests/ -q` (currently 25 passing).
+Run: `cd backend; uv run pytest tests/ -q` (currently 243 passing).
 
 ---
 

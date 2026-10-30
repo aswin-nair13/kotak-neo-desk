@@ -34,7 +34,7 @@ log = logging.getLogger("startup")
 if not settings.app_password_bcrypt:
     log.warning("APP_PASSWORD_BCRYPT is empty — /api/auth/login will 401. "
                 "Set it in the repo-root .env (see .env.example).")
-if settings.jwt_secret == "change-me":
+if not settings.jwt_secret or settings.jwt_secret.startswith("change-me"):
     log.warning("JWT_SECRET is still the default — set a random 32+ char value in .env.")
 
 BUILD = "sfeed-bridge"

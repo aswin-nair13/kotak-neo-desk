@@ -76,7 +76,7 @@ bridge thread and read on the loop.
 | No login rate-limit/lockout | `routes/auth.py:15-19` | Add per-IP throttle / backoff. |
 | `app_login(body: dict)` unvalidated | `routes/auth.py:16` | Use a Pydantic model. |
 | Container runs as root; no healthcheck/limits | `Dockerfile`, `docker-compose.yml` | Add `USER`, `HEALTHCHECK`, `mem_limit`/`cpus`. |
-| UFW refresh never deletes old IPs | `deploy/ufw-refresh.sh:9-15` | Actually `ufw delete` prior home-IP rules before adding; a stale dynamic IP stays whitelisted forever otherwise. |
+| UFW refresh never deletes old IPs | `deploy/ufw-refresh.sh` | **Fixed**: manages one tagged `home-ssh` rule (delete-then-add, SSH only; 80/443 never opened). |
 | Blocking DNS in async middleware | `auth.py:78` | Resolve hostnames in an executor / cache off-loop. |
 | `initiate_login` leaks pending clients | `kotak_client.py:57-62` | Discard/overwrite any existing `pending_client`. |
 | `_wanted` subscription grows unbounded | `sfeed_bridge.py` | Unsubscribe removed watchlist legs; cap the set. |
